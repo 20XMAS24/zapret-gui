@@ -23,6 +23,24 @@ $ProgressPreference = "SilentlyContinue"
 Set-Location $PSScriptRoot
 
 function Step($t) { Write-Host "`n==> $t" -ForegroundColor Cyan }
+# Throws unless $path is a non-empty path inside $parent (guards every recursive copy).
+function Assert-Inside($path, $parent) {
+    if ([string]::IsNullOrWhiteSpace($path)) { throw "source not found inside $parent" }
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\') + '\'
+    $root = [IO.Path]::GetFullPath($parent).TrimEnd('\') + '\'
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "refusing to use $path (outside $parent)" }
+}
+# Always extracts into a fresh folder under dist\cache, never reuses a possibly broken one.
+function Expand-Fresh($zip, $name) {
+    $dir = Join-Path $cache $name
+    Assert-Inside $dir $cache
+    if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+    New-Item -ItemType Directory $dir | Out-Null
+    & $tarExe -xf $zip -C $dir
+    if ($LASTEXITCODE) { throw "cannot extract $zip" }
+    if (-not (Get-ChildItem -LiteralPath $dir -Recurse -File | Select-Object -First 1)) { throw "$zip extracted to nothing" }
+    return $dir
+}
 function Fetch($url, $dest) {
     if (-not (Test-Path $dest)) {
         Write-Host "    download $url"
@@ -63,7 +81,8 @@ if ($LASTEXITCODE) { throw "cargo build failed" }
 # ---- staging
 $dist = Join-Path $PSScriptRoot "dist"; $cache = Join-Path $dist "cache"; $stage = Join-Path $dist "stage"
 New-Item -ItemType Directory -Force $cache | Out-Null
-if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+Assert-Inside $stage $dist
+if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force "$stage\bin", "$stage\zapret" | Out-Null
 Copy-Item "target\release\ZapretGUI.exe" $stage
 
@@ -71,11 +90,13 @@ Step "zapret (official release)"
 $zv = (Invoke-WebRequest "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/version.txt" -UseBasicParsing -TimeoutSec 60).Content.Trim()
 $zzip = Join-Path $cache "zapret-$zv.zip"
 Fetch "https://github.com/Flowseal/zapret-discord-youtube/releases/download/$zv/zapret-discord-youtube-$zv.zip" $zzip
-$zx = Join-Path $cache "zapret-$zv"
-if (-not (Test-Path $zx)) { New-Item -ItemType Directory $zx | Out-Null; & $tarExe -xf $zzip -C $zx; if ($LASTEXITCODE) { throw "tar failed" } }
-$zsrc = $zx
-if (-not (Get-ChildItem $zsrc -Filter *.bat)) { $zsrc = (Get-ChildItem $zx -Directory | Select-Object -First 1).FullName }
-Copy-Item "$zsrc\*" "$stage\zapret" -Recurse -Force
+$zx = Expand-Fresh $zzip "zapret-$zv"
+# The release zip wraps everything in one folder: find the folder that actually holds the .bat files.
+$zsrc = @($zx) + @(Get-ChildItem -LiteralPath $zx -Directory | ForEach-Object { $_.FullName }) |
+    Where-Object { Get-ChildItem -LiteralPath $_ -Filter *.bat -File } | Select-Object -First 1
+Assert-Inside $zsrc $zx
+if (-not (Test-Path -LiteralPath (Join-Path $zsrc "bin\winws.exe"))) { throw "zapret archive has no bin\winws.exe" }
+Copy-Item -Path (Join-Path $zsrc "*") -Destination "$stage\zapret" -Recurse -Force
 New-Item -ItemType Directory -Force "$stage\zapret\.service" | Out-Null
 Set-Content "$stage\zapret\.service\version.txt" $zv -NoNewline -Encoding ASCII
 Write-Host "    zapret $zv"
@@ -83,6 +104,7 @@ Write-Host "    zapret $zv"
 Step "TgWsProxy (latest release)"
 $tg = Invoke-RestMethod "https://api.github.com/repos/Flowseal/tg-ws-proxy/releases/latest" -TimeoutSec 60 -Headers @{ "User-Agent" = "ZapretGUI-release" }
 $tgUrl = ($tg.assets | Where-Object { $_.name -eq "TgWsProxy_windows.exe" } | Select-Object -First 1).browser_download_url
+if (-not $tgUrl) { throw "TgWsProxy release has no TgWsProxy_windows.exe" }
 $tgFile = Join-Path $cache "TgWsProxy_windows-$($tg.tag_name).exe"
 Fetch $tgUrl $tgFile
 Copy-Item $tgFile "$stage\TgWsProxy_windows.exe"
@@ -91,9 +113,14 @@ Write-Host "    TgWsProxy $($tg.tag_name)"
 Step "sing-box $SingBoxVersion"
 $sbzip = Join-Path $cache "sing-box-$SingBoxVersion.zip"
 Fetch "https://github.com/SagerNet/sing-box/releases/download/v$SingBoxVersion/sing-box-$SingBoxVersion-windows-amd64.zip" $sbzip
-$sbx = Join-Path $cache "sing-box-$SingBoxVersion"
-if (-not (Test-Path $sbx)) { New-Item -ItemType Directory $sbx | Out-Null; & $tarExe -xf $sbzip -C $sbx; if ($LASTEXITCODE) { throw "tar failed" } }
-Copy-Item (Get-ChildItem $sbx -Recurse -Filter sing-box.exe | Select-Object -First 1).FullName "$stage\bin\sing-box.exe"
+$sbx = Expand-Fresh $sbzip "sing-box-$SingBoxVersion"
+$sbExe = (Get-ChildItem -LiteralPath $sbx -Recurse -Filter sing-box.exe -File | Select-Object -First 1).FullName
+Assert-Inside $sbExe $sbx
+Copy-Item -LiteralPath $sbExe -Destination "$stage\bin\sing-box.exe"
+
+$mb = (Get-ChildItem -LiteralPath $stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
+if ($mb -gt 300) { throw ("staging is {0:N0} MB - something went wrong, aborting" -f $mb) }
+Write-Host ("    staging: {0:N1} MB" -f $mb)
 
 # ---- installer
 Step "Inno Setup"
