@@ -400,3 +400,21 @@ pub fn windows_build() -> u32 {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
+
+/// Windows 11: rounded corners and a thin border in the theme color for our frameless window.
+/// Silently does nothing on Windows 10.
+pub fn style_window(hwnd: isize, border: eframe::egui::Color32) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    if hwnd == 0 {
+        return;
+    }
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWCP_ROUND: u32 = 2;
+    let colorref: u32 = (border.r() as u32) | ((border.g() as u32) << 8) | ((border.b() as u32) << 16);
+    unsafe {
+        let h = hwnd as *mut c_void;
+        DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_ROUND as *const u32 as *const c_void, 4);
+        DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, &colorref as *const u32 as *const c_void, 4);
+    }
+}

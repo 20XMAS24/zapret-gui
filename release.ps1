@@ -6,6 +6,11 @@
     .\release.ps1 -Version 2.0.1      bump Cargo.toml version first
     .\release.ps1 -Publish            also create GitHub release v<ver> with both files
     .\release.ps1 -Publish -Notes "What changed"
+    .\release.ps1 -Publish -NotesFile notes.md
+
+  Release notes are what users see in the "Что нового" window after the update (Markdown:
+  "## heading", "- item"). Without -Notes / -NotesFile they are built from commit subjects
+  since the previous tag.
 
   The repository comes from `git remote get-url origin` (or -Repo owner/name).
   Nothing from your local zapret folder (lists, ini, proxies) gets into the installer.
@@ -14,6 +19,7 @@ param(
     [string]$Version = "",
     [switch]$Publish,
     [string]$Notes = "",
+    [string]$NotesFile = "",
     [string]$Repo = "",
     [string]$SingBoxVersion = "1.14.4"
 )
@@ -141,7 +147,20 @@ if ($Publish) {
     try { $ErrorActionPreference = "Continue"; gh release view "v$ver" --repo $Repo 2>&1 | Out-Null; $exists = ($LASTEXITCODE -eq 0) }
     finally { $ErrorActionPreference = "Stop" }
     if ($exists) { throw "release v$ver already exists - bump the version (-Version x.y.z)" }
-    if (-not $Notes) { $Notes = "ZAPRET GUI $ver`n`nУстановщик: $setupName. Установленные копии обновятся сами (Настройки -> Обновления)." }
+    if (-not $Notes -and $NotesFile) { $Notes = [IO.File]::ReadAllText((Resolve-Path $NotesFile)) }
+    if (-not $Notes) {
+        # Commit subjects since the previous release tag (Co-Authored-By lines are not subjects).
+        $prev = ""
+        try {
+            $ErrorActionPreference = "Continue"
+            git fetch --tags --quiet 2>$null   # release tags are created on GitHub by `gh release create`
+            $prev = (git describe --tags --abbrev=0 2>$null)
+        } finally { $ErrorActionPreference = "Stop" }
+        $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
+        $items = @(git log $range --no-merges --pretty=format:"- %s")
+        $Notes = "## Изменения`n" + ($(if ($items.Count) { $items -join "`n" } else { "- Исправления и улучшения" }))
+    }
+    $Notes += "`n`n---`nУстановщик: $setupName. Установленные копии обновятся сами."
     gh release create "v$ver" $setup "$setup.sha256" --repo $Repo --title "ZAPRET GUI $ver" --notes $Notes
     if ($LASTEXITCODE) { throw "gh release create failed" }
     Write-Host "    https://github.com/$Repo/releases/tag/v$ver" -ForegroundColor Green

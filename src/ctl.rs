@@ -51,6 +51,8 @@ pub struct State {
     pub pending_tg: Option<(String, PathBuf)>,
     pub app_remote: Option<String>,
     pub pending_app: Option<(String, PathBuf)>,
+    /// (version, release notes) to show once after ZapretGUI was updated.
+    pub whats_new: Option<(String, String)>,
     pub progress: Option<f32>,
     pub checking: bool,
     pub updating: bool,
@@ -105,6 +107,7 @@ impl Core {
                 pending_tg: None,
                 app_remote: None,
                 pending_app: None,
+                whats_new: None,
                 progress: None,
                 checking: false,
                 updating: false,
@@ -229,6 +232,8 @@ impl Core {
         }
 
         self.start_monitor();
+        self.start_update_timer();
+        self.detect_new_version();
 
         // Right after a self-update: bring back whatever was running before it.
         let resume = {
@@ -274,6 +279,44 @@ impl Core {
         if self.cfg_bool("CheckUpdates", true) {
             self.check_updates(false);
         }
+    }
+
+    /// First start of a new version (self-update or manual install): show what changed, once.
+    fn detect_new_version(self: &Arc<Self>) {
+        let cur = updater::APP_VERSION;
+        let last = {
+            let mut c = lock(&self.cfg);
+            let last = c.get("LastVersion").map(str::to_string);
+            if last.as_deref() != Some(cur) {
+                c.set("LastVersion", cur);
+                c.save();
+            }
+            last
+        };
+        let Some(last) = last else { return }; // fresh install: nothing to announce
+        if last == cur || !updater::is_newer(&last, cur) {
+            return;
+        }
+        // Notes saved before the update, otherwise ask GitHub.
+        let saved = std::fs::read_to_string(updater::whatsnew_file()).ok().and_then(|t| {
+            let (v, notes) = t.split_once('\n')?;
+            (v.trim() == cur).then(|| notes.trim().to_string())
+        });
+        let _ = std::fs::remove_file(updater::whatsnew_file());
+        let me = self.clone();
+        self.spawn(move |_| {
+            let notes = saved
+                .filter(|n| !n.is_empty())
+                .or_else(|| updater::app_notes(&me.update_repo(), cur).ok())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Список изменений не указан в релизе.".into());
+            me.st().whats_new = Some((cur.to_string(), notes));
+            me.repaint();
+        });
+    }
+
+    pub fn dismiss_whats_new(&self) {
+        self.st().whats_new = None;
     }
 
     fn start_monitor(self: &Arc<Self>) {
@@ -540,11 +583,23 @@ impl Core {
             self.log("Проверка обновлений...", Kind::Info);
         }
         self.spawn(move |me| {
-            me.check_app(manual);
+            if me.check_app(manual) {
+                return; // installer takes over, the app is about to exit
+            }
             me.check_zapret(manual);
             me.check_tg(manual);
             me.st().checking = false;
             me.repaint();
+            if me.auto_update() {
+                if me.st().pending_zap.is_some() {
+                    me.log("Автообновление: устанавливаю новую версию zapret.", Kind::Info);
+                    me.apply_zapret_sync();
+                }
+                if me.st().pending_tg.is_some() {
+                    me.log("Автообновление: устанавливаю новую версию TgWsProxy.", Kind::Info);
+                    me.apply_tg_sync();
+                }
+            }
         });
     }
 
@@ -553,10 +608,25 @@ impl Core {
         if r.trim().is_empty() { updater::APP_REPO.to_string() } else { r.trim().to_string() }
     }
 
-    fn check_app(&self, manual: bool) {
+    pub fn auto_update(&self) -> bool {
+        self.cfg_bool("AutoUpdate", true)
+    }
+
+    /// Re-checks every 6 hours while the app keeps running.
+    fn start_update_timer(self: &Arc<Self>) {
+        self.spawn(|me| loop {
+            thread::sleep(Duration::from_secs(6 * 3600));
+            if me.cfg_bool("CheckUpdates", true) && !me.st().updating {
+                me.check_updates(false);
+            }
+        });
+    }
+
+    /// Returns true when an automatic self-update has been started.
+    fn check_app(self: &Arc<Self>, manual: bool) -> bool {
         let repo = self.update_repo();
         if repo.starts_with("OWNER/") {
-            return; // repository not configured in this build
+            return false; // repository not configured in this build
         }
         let rel = match updater::app_query(&repo) {
             Ok(r) => r,
@@ -564,7 +634,7 @@ impl Core {
                 if manual {
                     self.log(&format!("Проверка обновлений ZapretGUI не удалась: {e}"), Kind::Warn);
                 }
-                return;
+                return false;
             }
         };
         self.st().app_remote = Some(rel.version.clone());
@@ -572,7 +642,7 @@ impl Core {
             if manual {
                 self.log(&format!("ZapretGUI актуален ({}).", updater::APP_VERSION), Kind::Ok);
             }
-            return;
+            return false;
         }
         self.log(&format!("Доступна новая версия ZapretGUI: {} (у вас {}). Скачиваю...", rel.version, updater::APP_VERSION), Kind::Warn);
         self.st().progress = Some(0.0);
@@ -590,11 +660,19 @@ impl Core {
         self.st().progress = None;
         match r {
             Ok(f) => {
+                // Keep the notes so the new version can show "Что нового" on its first start.
+                let _ = std::fs::write(updater::whatsnew_file(), format!("{}\n{}", rel.version, rel.notes));
+                self.st().pending_app = Some((rel.version.clone(), f));
+                if self.auto_update() && !self.st().updating {
+                    self.log(&format!("Автообновление: устанавливаю ZapretGUI {}, приложение перезапустится.", rel.version), Kind::Info);
+                    self.apply_app_update();
+                    return true;
+                }
                 self.log(&format!("Установщик {} загружен, контрольная сумма совпала. Нажмите «Обновить ZapretGUI» в настройках.", rel.version), Kind::Ok);
-                self.st().pending_app = Some((rel.version, f));
             }
             Err(e) => self.log(&format!("Обновление ZapretGUI: {e}"), Kind::Error),
         }
+        false
     }
 
     /// Stops everything (files must not be locked), remembers what was running and hands over
@@ -639,7 +717,7 @@ impl Core {
         });
     }
 
-    fn check_zapret(&self, manual: bool) {
+    fn check_zapret(self: &Arc<Self>, manual: bool) {
         let local = zapret::local_version();
         let remote = match updater::zapret_remote_version() {
             Ok(r) => r,
@@ -682,7 +760,7 @@ impl Core {
         }
     }
 
-    fn check_tg(&self, manual: bool) {
+    fn check_tg(self: &Arc<Self>, manual: bool) {
         let (tag, url) = match updater::tg_query() {
             Ok(v) => v,
             Err(e) => {
@@ -716,10 +794,15 @@ impl Core {
     }
 
     pub fn apply_zapret_update(self: &Arc<Self>) {
+        self.spawn(|me| me.apply_zapret_sync());
+    }
+
+    fn apply_zapret_sync(self: &Arc<Self>) {
         let Some((ver, zip)) = self.st().pending_zap.clone() else { return };
         self.st().updating = true;
         self.log("▸ Обновление zapret...", Kind::Head);
-        self.spawn(move |me| {
+        let me = self;
+        {
             let (was_running, strategy) = {
                 let s = me.st();
                 (s.zapret_running, s.current_strategy.clone())
@@ -749,13 +832,19 @@ impl Core {
             }
             me.st().updating = false;
             me.repaint();
-        });
+        }
     }
 
     pub fn apply_tg_update(self: &Arc<Self>) {
+        self.spawn(|me| me.apply_tg_sync());
+    }
+
+    fn apply_tg_sync(self: &Arc<Self>) {
         let Some((tag, file)) = self.st().pending_tg.clone() else { return };
         self.st().updating = true;
-        self.spawn(move |me| {
+        let me = self;
+        let was_running = tg::is_running();
+        {
             match updater::tg_apply(&file) {
                 Ok(t) => {
                     me.log(&format!("TgWsProxy обновлён: {}", t.file_name().unwrap_or_default().to_string_lossy()), Kind::Ok);
@@ -770,9 +859,12 @@ impl Core {
                 }
                 Err(e) => me.log(&format!("Обновление TgWsProxy не удалось: {e}"), Kind::Error),
             }
+            if was_running {
+                me.start_tg_sync();
+            }
             me.st().updating = false;
             me.repaint();
-        });
+        }
     }
 
     // ---------------------------------------------------------------- tools

@@ -275,6 +275,8 @@ pub struct AppRelease {
     pub setup_name: String,
     pub setup_url: String,
     pub sha_url: Option<String>,
+    /// Release description (Markdown) — shown as "Что нового" after the update.
+    pub notes: String,
 }
 
 /// Latest release of ZapretGUI itself: expects assets `ZapretGUI-Setup-<ver>.exe` and `<that>.sha256`.
@@ -301,7 +303,8 @@ pub fn app_query(repo: &str) -> Result<AppRelease, String> {
     .ok_or("в релизе нет установщика ZapretGUI-Setup-*.exe")?;
     let sha_name = format!("{setup_name}.sha256");
     let sha_url = name_url(&|n: &str| n.eq_ignore_ascii_case(&sha_name)).map(|(_, u)| u);
-    Ok(AppRelease { version, setup_name, setup_url, sha_url })
+    let notes = v["body"].as_str().unwrap_or("").trim().to_string();
+    Ok(AppRelease { version, setup_name, setup_url, sha_url, notes })
 }
 
 pub fn sha256_file(path: &Path) -> Result<String, String> {
@@ -336,4 +339,16 @@ pub fn app_download(rel: &AppRelease, progress: impl FnMut(u64, u64)) -> Result<
         return Err(format!("контрольная сумма не совпала (ожидалась {expected}, получена {got}) — файл удалён"));
     }
     Ok(dest)
+}
+
+/// Release notes of a specific version (used when the update was installed by hand).
+pub fn app_notes(repo: &str, version: &str) -> Result<String, String> {
+    let txt = get_string(&format!("https://api.github.com/repos/{repo}/releases/tags/v{version}"))?;
+    let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+    Ok(v["body"].as_str().unwrap_or("").trim().to_string())
+}
+
+/// Notes of a downloaded-but-not-yet-installed version, kept until the new version starts.
+pub fn whatsnew_file() -> PathBuf {
+    paths::exe_dir().join("ZapretGUI.whatsnew.txt")
 }
