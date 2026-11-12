@@ -619,9 +619,11 @@ impl Core {
             }
             me.shutdown(true);
             // Give this process a moment to exit before the installer replaces its files.
+            // /DIR keeps the update in the folder we run from (also for a copy that was never installed).
             let cmd = format!(
-                "/c ping -n 3 127.0.0.1 >nul & \"{}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-",
-                setup.display()
+                "/c ping -n 3 127.0.0.1 >nul & \"{}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- \"/DIR={}\"",
+                setup.display(),
+                paths::exe_dir().display()
             );
             let r = {
                 use std::os::windows::process::CommandExt;
