@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "zapret-gui"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "eframe",
  "embed-manifest",
