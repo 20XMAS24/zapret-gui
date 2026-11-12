@@ -49,7 +49,6 @@ enum Dialog {
     ClearDiscord,
     ApplyZapret(String),
     ApplyApp(String),
-    RestartTg,
     DeleteProfile(usize),
 }
 
@@ -1055,8 +1054,11 @@ impl App {
                                 Err(e) => self.core.log(&e, Kind::Warn),
                             }
                         }
+                        // A running TgWsProxy keeps the old secret/port until restarted, and the
+                        // "Открыть в Telegram" link already uses the new ones: restart right away.
                         if st.tg_running {
-                            self.dialog = Some(Dialog::RestartTg);
+                            self.core.restart_tg();
+                            self.tg_msg = Some((true, "Сохранено, TgWsProxy перезапущен. Нажмите «Открыть в Telegram», чтобы обновить прокси в Telegram.".into()));
                         }
                     }
                     Err(e) => self.tg_msg = Some((false, e)),
@@ -1391,7 +1393,6 @@ impl App {
                 "Обновить",
                 false,
             ),
-            Dialog::RestartTg => ("TgWsProxy", "TgWsProxy запущен. Перезапустить его, чтобы настройки применились?".to_string(), "Перезапустить", false),
             Dialog::DeleteProfile(i) => {
                 let name = self.core.proxy_settings().profiles.get(*i).map(|p| p.display_name()).unwrap_or_default();
                 ("Удалить профиль", format!("Удалить прокси-профиль «{name}»?"), "Удалить", true)
@@ -1446,7 +1447,6 @@ impl App {
                     }
                     Dialog::ApplyZapret(_) => self.core.apply_zapret_update(),
                     Dialog::ApplyApp(_) => self.core.apply_app_update(),
-                    Dialog::RestartTg => self.core.restart_tg(),
                     Dialog::DeleteProfile(i) => {
                         let mut ps = self.core.proxy_settings();
                         if i < ps.profiles.len() {

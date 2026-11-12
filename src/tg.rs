@@ -187,11 +187,25 @@ pub fn telegram_link() -> String {
         host = "127.0.0.1".into();
     }
     let port = get_num(&c, "port") as i64;
-    let secret = get_str(&c, "secret");
+    let secret = normalize_secret(&get_str(&c, "secret"));
     let mut s = format!("tg://proxy?server={host}&port={port}");
     if !secret.is_empty() {
+        // TgWsProxy runs in "secure" (padded) mode unless no_secure is set: the client then
+        // needs the secret with a "dd" prefix, otherwise Telegram cannot connect.
         s.push_str("&secret=");
+        if !get_bool(&c, "no_secure") {
+            s.push_str("dd");
+        }
         s.push_str(&secret);
+    }
+    s
+}
+
+/// The 32-hex secret as TgWsProxy stores it: lowercased, a pasted "dd"/"ee" client prefix removed.
+pub fn normalize_secret(s: &str) -> String {
+    let s = s.trim().to_ascii_lowercase();
+    if s.len() == 34 && (s.starts_with("dd") || s.starts_with("ee")) {
+        return s[2..].to_string();
     }
     s
 }
@@ -314,10 +328,15 @@ impl Form {
             .parse()
             .map_err(|_| "«Макс. размер лога»: нужно число".to_string())?;
 
+        let secret = normalize_secret(&self.secret);
+        if !secret.is_empty() && (secret.len() != 32 || !secret.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err("«Секрет»: нужно 32 шестнадцатеричных символа (кнопка 🎲 сгенерирует)".into());
+        }
+
         let mut c = load();
         c.insert("host".into(), json!(self.host.trim()));
         c.insert("port".into(), json!(port));
-        c.insert("secret".into(), json!(self.secret.trim()));
+        c.insert("secret".into(), json!(secret));
         set_dc_list(&mut c, &self.dc);
         c.insert("cfproxy".into(), json!(self.cfproxy));
         set_list_str(&mut c, "cfproxy_user_domain", "cfproxy_user_domain_enabled", &self.cf_user);
