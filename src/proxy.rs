@@ -469,7 +469,7 @@ mod tests {
         s.bypass_processes = "Discord.exe, steam.exe".into();
         s.bypass_domains = "gosuslugi.ru\n*.sber.ru".into();
         let v = singbox_config(&p, "1.2.3.4:1080".parse().unwrap(), &s);
-        let out = std::env::var("SB_TEST_OUT").unwrap_or_else(|_| "sb-test.json".into());
+        let out = std::env::var("SB_TEST_OUT").unwrap_or_else(|_| std::env::temp_dir().join("sb-test.json").display().to_string());
         std::fs::write(&out, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         let mut h = p.clone(); h.kind = ProxyKind::Http;
         let v2 = singbox_config(&h, "1.2.3.4:3128".parse().unwrap(), &Settings::default());
