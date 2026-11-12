@@ -1,0 +1,478 @@
+//! Proxy profiles, sing-box TUN config generation and a direct handshake test.
+
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::{paths, sys};
+
+pub const TUN_NAME: &str = "ZapretTun";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyKind {
+    #[default]
+    Socks5,
+    Http,
+}
+
+impl ProxyKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProxyKind::Socks5 => "SOCKS5",
+            ProxyKind::Http => "HTTP",
+        }
+    }
+}
+
+fn ser_secret<S: serde::Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&sys::protect_str(v))
+}
+fn de_secret<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let hex = String::deserialize(d)?;
+    Ok(sys::unprotect_str(&hex))
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Profile {
+    pub name: String,
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: String,
+    pub username: String,
+    /// Stored encrypted with DPAPI (current Windows user only).
+    #[serde(rename = "password_dpapi", serialize_with = "ser_secret", deserialize_with = "de_secret")]
+    pub password: String,
+}
+
+impl Profile {
+    pub fn display_name(&self) -> String {
+        if !self.name.trim().is_empty() {
+            self.name.trim().to_string()
+        } else if !self.host.trim().is_empty() {
+            format!("{}:{}", self.host.trim(), self.port.trim())
+        } else {
+            "Новый прокси".into()
+        }
+    }
+
+    pub fn port_num(&self) -> Result<u16, String> {
+        match self.port.trim().parse::<u16>() {
+            Ok(p) if p > 0 => Ok(p),
+            _ => Err("Укажите порт прокси (1–65535).".into()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<u16, String> {
+        if self.host.trim().is_empty() {
+            return Err("Укажите адрес прокси-сервера.".into());
+        }
+        self.port_num()
+    }
+
+    /// Resolves the proxy host (IPv4 preferred). Done by us so the kill switch can whitelist the IP.
+    pub fn resolve(&self) -> Result<SocketAddr, String> {
+        let port = self.validate()?;
+        let host = self.host.trim().trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("не удалось найти адрес {host}: {e}"))?
+            .collect();
+        addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| addrs.first())
+            .copied()
+            .ok_or_else(|| format!("не удалось найти адрес {host}"))
+    }
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Accepts `socks5://user:pass@host:port`, `http://host:port`, `user:pass@host:port`,
+/// `host:port:user:pass` and plain `host:port`.
+pub fn parse_line(input: &str) -> Option<Profile> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut p = Profile::default();
+    let mut rest = s;
+    if let Some(i) = s.find("://") {
+        let scheme = s[..i].to_ascii_lowercase();
+        p.kind = match scheme.as_str() {
+            "socks" | "socks5" | "socks5h" => ProxyKind::Socks5,
+            "http" => ProxyKind::Http,
+            _ => return None,
+        };
+        rest = &s[i + 3..];
+    }
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+
+    let (auth, hostport) = match rest.rfind('@') {
+        Some(i) => (Some(&rest[..i]), &rest[i + 1..]),
+        None => (None, rest),
+    };
+
+    // host:port, [v6]:port or host:port:user:pass
+    let (host, port, extra): (String, String, Option<(String, String)>) = if let Some(stripped) = hostport.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        let host = stripped[..end].to_string();
+        let port = stripped[end + 1..].trim_start_matches(':').to_string();
+        (host, port, None)
+    } else {
+        let parts: Vec<&str> = hostport.split(':').collect();
+        match parts.len() {
+            2 => (parts[0].into(), parts[1].into(), None),
+            4 if auth.is_none() => (parts[0].into(), parts[1].into(), Some((parts[2].into(), parts[3].into()))),
+            _ => return None,
+        }
+    };
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return None;
+    }
+    p.host = host;
+    p.port = port;
+    if let Some(a) = auth {
+        let (u, pw) = a.split_once(':').unwrap_or((a, ""));
+        p.username = pct_decode(u);
+        p.password = pct_decode(pw);
+    } else if let Some((u, pw)) = extra {
+        p.username = u;
+        p.password = pw;
+    }
+    Some(p)
+}
+
+// ------------------------------------------------------------------ settings
+
+pub const DNS_CHOICES: &[(&str, &str)] = &[
+    ("1.1.1.1", "Cloudflare 1.1.1.1"),
+    ("8.8.8.8", "Google 8.8.8.8"),
+    ("9.9.9.9", "Quad9 9.9.9.9"),
+    ("77.88.8.8", "Яндекс 77.88.8.8"),
+];
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub profiles: Vec<Profile>,
+    pub selected: usize,
+    pub kill_switch: bool,
+    pub allow_lan: bool,
+    pub block_quic: bool,
+    pub auto_reconnect: bool,
+    pub connect_on_launch: bool,
+    pub dns: String,
+    pub bypass_processes: String,
+    pub bypass_domains: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            profiles: Vec::new(),
+            selected: 0,
+            kill_switch: true,
+            allow_lan: true,
+            block_quic: true,
+            auto_reconnect: true,
+            connect_on_launch: false,
+            dns: "1.1.1.1".into(),
+            bypass_processes: String::new(),
+            bypass_domains: String::new(),
+        }
+    }
+}
+
+impl Settings {
+    pub fn load() -> Self {
+        std::fs::read(paths::proxy_json())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        if let Ok(s) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(paths::proxy_json(), s);
+        }
+    }
+
+    pub fn current(&self) -> Option<&Profile> {
+        self.profiles.get(self.selected)
+    }
+}
+
+fn split_list(s: &str) -> Vec<String> {
+    s.split(['\n', '\r', ',', ';', ' '])
+        .map(|x| x.trim().trim_start_matches("*.").trim_start_matches('.').to_string())
+        .filter(|x| !x.is_empty() && !x.starts_with('#'))
+        .collect()
+}
+
+/// Builds a sing-box (1.12+ schema) config: TUN with auto_route captures all traffic,
+/// DNS goes over DoH through the proxy, optional direct rules for LAN / processes / domains.
+pub fn singbox_config(p: &Profile, server: SocketAddr, s: &Settings) -> Value {
+    let mut out = json!({
+        "type": match p.kind { ProxyKind::Socks5 => "socks", ProxyKind::Http => "http" },
+        "tag": "proxy",
+        "server": server.ip().to_string(),
+        "server_port": server.port(),
+    });
+    if p.kind == ProxyKind::Socks5 {
+        out["version"] = json!("5");
+    }
+    if !p.username.is_empty() {
+        out["username"] = json!(p.username);
+        out["password"] = json!(p.password);
+    }
+
+    let procs = split_list(&s.bypass_processes);
+    let domains = split_list(&s.bypass_domains);
+
+    let mut dns_rules = Vec::new();
+    if !domains.is_empty() {
+        dns_rules.push(json!({ "domain_suffix": domains, "server": "dns-local" }));
+    }
+
+    let mut rules = vec![
+        json!({ "action": "sniff" }),
+        json!({ "protocol": "dns", "action": "hijack-dns" }),
+    ];
+    if s.allow_lan {
+        rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
+    }
+    if !procs.is_empty() {
+        rules.push(json!({ "process_name": procs, "outbound": "direct" }));
+    }
+    if !domains.is_empty() {
+        rules.push(json!({ "domain_suffix": domains, "outbound": "direct" }));
+    }
+    if s.block_quic {
+        rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));
+    }
+
+    let dns = if s.dns.trim().is_empty() { "1.1.1.1".to_string() } else { s.dns.trim().to_string() };
+
+    json!({
+        "log": { "level": "warn", "timestamp": false },
+        "dns": {
+            "servers": [
+                { "type": "https", "tag": "dns-remote", "server": dns, "detour": "proxy" },
+                { "type": "local", "tag": "dns-local" }
+            ],
+            "rules": dns_rules,
+            "final": "dns-remote",
+            "strategy": "prefer_ipv4"
+        },
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": TUN_NAME,
+            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "mtu": 9000,
+            "auto_route": true,
+            "strict_route": true
+        }],
+        "outbounds": [ out, { "type": "direct", "tag": "direct" } ],
+        "route": {
+            "rules": rules,
+            "final": "proxy",
+            "auto_detect_interface": true,
+            "default_domain_resolver": "dns-local"
+        }
+    })
+}
+
+// ---------------------------------------------------------------------- test
+
+fn b64(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::new();
+    for c in input.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        s.push(T[(n >> 18) as usize & 63] as char);
+        s.push(T[(n >> 12) as usize & 63] as char);
+        s.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        s.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    s
+}
+
+const TEST_HOST: &str = "cp.cloudflare.com";
+
+fn read_exact_t(s: &mut TcpStream, n: usize) -> Result<Vec<u8>, String> {
+    let mut b = vec![0u8; n];
+    s.read_exact(&mut b).map_err(|e| format!("сервер оборвал соединение: {e}"))?;
+    Ok(b)
+}
+
+fn socks5_connect(s: &mut TcpStream, p: &Profile) -> Result<(), String> {
+    let auth = !p.username.is_empty();
+    s.write_all(if auth { &[5, 2, 0, 2] } else { &[5, 1, 0] }).map_err(|e| e.to_string())?;
+    let r = read_exact_t(s, 2)?;
+    if r[0] != 5 {
+        return Err("это не SOCKS5-сервер".into());
+    }
+    match r[1] {
+        0 => {}
+        2 => {
+            let (u, pw) = (p.username.as_bytes(), p.password.as_bytes());
+            let mut m = vec![1, u.len() as u8];
+            m.extend_from_slice(u);
+            m.push(pw.len() as u8);
+            m.extend_from_slice(pw);
+            s.write_all(&m).map_err(|e| e.to_string())?;
+            let a = read_exact_t(s, 2)?;
+            if a[1] != 0 {
+                return Err("неверный логин или пароль".into());
+            }
+        }
+        0xFF => return Err("сервер требует авторизацию — укажите логин и пароль".into()),
+        m => return Err(format!("неподдерживаемый метод авторизации {m}")),
+    }
+    let mut req = vec![5, 1, 0, 3, TEST_HOST.len() as u8];
+    req.extend_from_slice(TEST_HOST.as_bytes());
+    req.extend_from_slice(&80u16.to_be_bytes());
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    let h = read_exact_t(s, 4)?;
+    if h[1] != 0 {
+        return Err(format!("прокси отказал в соединении (код {})", h[1]));
+    }
+    let skip = match h[3] {
+        1 => 4,
+        4 => 16,
+        3 => read_exact_t(s, 1)?[0] as usize,
+        _ => 0,
+    };
+    read_exact_t(s, skip + 2)?;
+    Ok(())
+}
+
+fn http_connect(s: &mut TcpStream, p: &Profile) -> Result<(), String> {
+    let mut req = format!("CONNECT {TEST_HOST}:80 HTTP/1.1\r\nHost: {TEST_HOST}:80\r\n");
+    if !p.username.is_empty() {
+        req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", b64(format!("{}:{}", p.username, p.password).as_bytes())));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let head = read_head(s)?;
+    let code = status_code(&head);
+    match code {
+        200 => Ok(()),
+        407 => Err("неверный логин или пароль (407)".into()),
+        0 => Err("это не HTTP-прокси".into()),
+        c => Err(format!("прокси ответил кодом {c}")),
+    }
+}
+
+fn read_head(s: &mut TcpStream) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let mut b = [0u8; 1];
+    while buf.len() < 8192 {
+        match s.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => {
+                buf.push(b[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(e) => return Err(format!("нет ответа: {e}")),
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn status_code(head: &str) -> u16 {
+    head.lines()
+        .next()
+        .filter(|l| l.starts_with("HTTP/"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Connects to the proxy, tunnels to cp.cloudflare.com:80 and expects HTTP 204. Returns latency in ms.
+pub fn test(p: &Profile) -> Result<u128, String> {
+    let addr = p.resolve()?;
+    let t0 = Instant::now();
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(6)).map_err(|e| format!("нет соединения с {addr}: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(8))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(8))).ok();
+    match p.kind {
+        ProxyKind::Socks5 => socks5_connect(&mut s, p)?,
+        ProxyKind::Http => http_connect(&mut s, p)?,
+    }
+    s.write_all(format!("GET /generate_204 HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n").as_bytes())
+        .map_err(|e| e.to_string())?;
+    let head = read_head(&mut s)?;
+    let code = status_code(&head);
+    if code == 204 || code == 200 {
+        Ok(t0.elapsed().as_millis())
+    } else if code == 0 {
+        Err("через прокси не пришёл ответ от сайта".into())
+    } else {
+        Err(format!("сайт ответил кодом {code} через прокси"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_lines() {
+        let p = parse_line("socks5://us%40er:p%3Ass@proxy.example.com:1080").unwrap();
+        assert_eq!((p.kind, p.host.as_str(), p.port.as_str(), p.username.as_str(), p.password.as_str()),
+                   (ProxyKind::Socks5, "proxy.example.com", "1080", "us@er", "p:ss"));
+        let p = parse_line("http://1.2.3.4:3128").unwrap();
+        assert_eq!((p.kind, p.host.as_str(), p.port.as_str()), (ProxyKind::Http, "1.2.3.4", "3128"));
+        let p = parse_line("5.6.7.8:8000:login:pwd").unwrap();
+        assert_eq!((p.username.as_str(), p.password.as_str()), ("login", "pwd"));
+        let p = parse_line("user:pw@[2001:db8::1]:1080").unwrap();
+        assert_eq!((p.host.as_str(), p.port.as_str(), p.username.as_str()), ("2001:db8::1", "1080", "user"));
+        assert!(parse_line("vless://abc@host:443").is_none());
+        assert!(parse_line("garbage").is_none());
+    }
+
+    #[test]
+    fn writes_config() {
+        let p = Profile { name: "t".into(), kind: ProxyKind::Socks5, host: "1.2.3.4".into(), port: "1080".into(),
+                          username: "u".into(), password: "p".into() };
+        let mut s = Settings::default();
+        s.bypass_processes = "Discord.exe, steam.exe".into();
+        s.bypass_domains = "gosuslugi.ru\n*.sber.ru".into();
+        let v = singbox_config(&p, "1.2.3.4:1080".parse().unwrap(), &s);
+        let out = std::env::var("SB_TEST_OUT").unwrap_or_else(|_| "sb-test.json".into());
+        std::fs::write(&out, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        let mut h = p.clone(); h.kind = ProxyKind::Http;
+        let v2 = singbox_config(&h, "1.2.3.4:3128".parse().unwrap(), &Settings::default());
+        std::fs::write(format!("{out}.http.json"), serde_json::to_string_pretty(&v2).unwrap()).unwrap();
+    }
+}
