@@ -66,7 +66,8 @@ if (-not $iscc) { throw "Inno Setup 6 not found (winget install JRSoftware.InnoS
 # ---- version
 $toml = Get-Content Cargo.toml -Raw
 if ($Version) {
-    $toml = [regex]::Replace($toml, '(?m)^version = "[^"]+"', "version = `"$Version`"", 1)
+    # Only the first `version = ` line (the [package] one); a Regex instance is needed for a count.
+    $toml = ([regex]'(?m)^version = "[^"]+"').Replace($toml, "version = `"$Version`"", 1)
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot "Cargo.toml"), $toml)
 }
 $ver = [regex]::Match($toml, '(?m)^version = "([^"]+)"').Groups[1].Value
