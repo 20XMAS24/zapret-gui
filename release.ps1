@@ -136,8 +136,11 @@ Write-Host "    sha256 $hash"
 # ---- publish
 if ($Publish) {
     Step "GitHub release v$ver"
-    gh release view "v$ver" --repo $Repo *> $null
-    if ($LASTEXITCODE -eq 0) { throw "release v$ver already exists - bump the version (-Version x.y.z)" }
+    # PS 5.1 turns redirected native stderr into an error under ErrorActionPreference=Stop.
+    $exists = $false
+    try { $ErrorActionPreference = "Continue"; gh release view "v$ver" --repo $Repo 2>&1 | Out-Null; $exists = ($LASTEXITCODE -eq 0) }
+    finally { $ErrorActionPreference = "Stop" }
+    if ($exists) { throw "release v$ver already exists - bump the version (-Version x.y.z)" }
     if (-not $Notes) { $Notes = "ZAPRET GUI $ver`n`nУстановщик: $setupName. Установленные копии обновятся сами (Настройки -> Обновления)." }
     gh release create "v$ver" $setup "$setup.sha256" --repo $Repo --title "ZAPRET GUI $ver" --notes $Notes
     if ($LASTEXITCODE) { throw "gh release create failed" }
