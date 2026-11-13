@@ -1,6 +1,6 @@
 [package]
 name = "zapret-gui"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
 description = "ZAPRET GUI: strategies (winws), TgWsProxy, system-wide proxy tunnel with kill switch"
 publish = false
