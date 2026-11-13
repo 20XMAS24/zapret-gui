@@ -12,7 +12,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE, SYSTEMTIME,
 };
 use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
-use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    ConvertInterfaceAliasToLuid, GetBestInterface, GetIfEntry2, GetIpAddrTable, MIB_IF_ROW2, MIB_IPADDRROW_XP,
+};
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -300,6 +302,59 @@ pub fn iface_luid(alias: &str) -> Option<u64> {
         } else {
             None
         }
+    }
+}
+
+/// IPv4 address + netmask of every adapter in the system (other VPN tunnels included).
+pub fn local_ipv4_nets() -> Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    unsafe {
+        let mut size = 0u32;
+        GetIpAddrTable(null_mut(), &mut size, 0);
+        if size == 0 {
+            return Vec::new();
+        }
+        // u32 buffer keeps the table aligned.
+        let mut buf = vec![0u32; (size as usize).div_ceil(4) + 1];
+        let table = buf.as_mut_ptr() as *mut windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPADDRTABLE;
+        if GetIpAddrTable(table, &mut size, 0) != 0 {
+            return Vec::new();
+        }
+        let n = (*table).dwNumEntries as usize;
+        let rows = std::ptr::addr_of!((*table).table) as *const MIB_IPADDRROW_XP;
+        (0..n)
+            .map(|i| {
+                let r = &*rows.add(i);
+                (std::net::Ipv4Addr::from(r.dwAddr.to_ne_bytes()), std::net::Ipv4Addr::from(r.dwMask.to_ne_bytes()))
+            })
+            .collect()
+    }
+}
+
+pub struct RouteIface {
+    pub alias: String,
+    pub description: String,
+    /// Real network card (Ethernet/Wi-Fi). Virtual adapters — VPN tunnels, TUN/TAP — are `false`.
+    pub hardware: bool,
+}
+
+/// The adapter Windows would use right now to reach `ip`.
+pub fn route_iface(ip: std::net::Ipv4Addr) -> Option<RouteIface> {
+    unsafe {
+        let mut idx = 0u32;
+        if GetBestInterface(u32::from_ne_bytes(ip.octets()), &mut idx) != 0 {
+            return None;
+        }
+        let mut row: MIB_IF_ROW2 = std::mem::zeroed();
+        row.InterfaceIndex = idx;
+        if GetIfEntry2(&mut row) != 0 {
+            return None;
+        }
+        let s = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]);
+        Some(RouteIface {
+            alias: s(&row.Alias),
+            description: s(&row.Description),
+            hardware: row.InterfaceAndOperStatusFlags._bitfield & 1 != 0,
+        })
     }
 }
 

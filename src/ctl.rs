@@ -1056,7 +1056,26 @@ impl Core {
             thread::sleep(Duration::from_millis(100));
         }
 
-        let conf = proxy::singbox_config(&prof, addr, &settings);
+        // Another full-tunnel VPN (Sota Connect, Hiddify, WireGuard…) overrides our routes with narrower ones
+        // and often blocks direct exits: the proxy then works only through it, slowly, and DNS may die.
+        if !reconnect {
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                if let Some(i) = sys::route_iface(v4).filter(|i| !i.hardware && !v4.is_loopback()) {
+                    self.log(
+                        &format!(
+                            "⚠ Включён другой VPN: трафик к прокси идёт через адаптер «{}» ({}). \
+                             Он перехватывает маршруты, поэтому часть трафика пойдёт мимо прокси, пинг сильно вырастет, \
+                             DNS может не работать. Для нормальной работы выключите другой VPN.",
+                            i.alias, i.description
+                        ),
+                        Kind::Warn,
+                    );
+                }
+            }
+        }
+
+        let tun_v4 = proxy::pick_tun_v4(&sys::local_ipv4_nets());
+        let conf = proxy::singbox_config(&prof, addr, &settings, tun_v4);
         let work = paths::cache_dir().join("sing-box");
         let _ = std::fs::create_dir_all(&work);
         let conf_path = work.join("config.json");

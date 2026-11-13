@@ -1,7 +1,7 @@
 //! Proxy profiles, sing-box TUN config generation and a direct handshake test.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -235,9 +235,40 @@ fn split_list(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Candidate /30 subnets for our TUN (first host address of each). Deliberately NOT sing-box's
+/// default 172.19.0.1/30: other sing-box based VPNs (Sota Connect, Hiddify…) use it, and two adapters
+/// with the same address make Windows hand our tunnel's packets to the other one — TCP then lives on
+/// retransmits and ping jumps to 600–3000 ms.
+const TUN_V4_CANDIDATES: &[[u8; 4]] = &[
+    [172, 29, 53, 1],
+    [10, 233, 137, 1],
+    [192, 168, 243, 1],
+    [172, 26, 199, 1],
+    [10, 198, 71, 1],
+];
+const TUN_V6: &str = "fd5a:7e70:9c11::1/126";
+
+/// Picks the first candidate /30 that does not overlap any adapter's subnet.
+pub fn pick_tun_v4(used: &[(Ipv4Addr, Ipv4Addr)]) -> Ipv4Addr {
+    let ours_mask = u32::MAX << 2;
+    TUN_V4_CANDIDATES
+        .iter()
+        .map(|o| Ipv4Addr::from(*o))
+        .find(|c| {
+            let c = u32::from(*c);
+            used.iter().all(|(a, m)| {
+                let a = u32::from(*a);
+                // Overlap if either network contains the other: compare under the wider (shorter) mask.
+                let mask = u32::from(*m) & ours_mask;
+                a == 0 || (a & mask) != (c & mask)
+            })
+        })
+        .unwrap_or_else(|| Ipv4Addr::from(TUN_V4_CANDIDATES[0]))
+}
+
 /// Builds a sing-box (1.12+ schema) config: TUN with auto_route captures all traffic,
 /// DNS goes over DoH through the proxy, optional direct rules for LAN / processes / domains.
-pub fn singbox_config(p: &Profile, server: SocketAddr, s: &Settings) -> Value {
+pub fn singbox_config(p: &Profile, server: SocketAddr, s: &Settings, tun_v4: Ipv4Addr) -> Value {
     let mut out = json!({
         "type": match p.kind { ProxyKind::Socks5 => "socks", ProxyKind::Http => "http" },
         "tag": "proxy",
@@ -294,7 +325,7 @@ pub fn singbox_config(p: &Profile, server: SocketAddr, s: &Settings) -> Value {
             "type": "tun",
             "tag": "tun-in",
             "interface_name": TUN_NAME,
-            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "address": [format!("{tun_v4}/30"), TUN_V6],
             "mtu": 9000,
             "auto_route": true,
             "strict_route": true
@@ -462,17 +493,32 @@ mod tests {
     }
 
     #[test]
+    fn tun_subnet_avoids_other_adapters() {
+        let m30: Ipv4Addr = "255.255.255.252".parse().unwrap();
+        let m16: Ipv4Addr = "255.255.0.0".parse().unwrap();
+        // Another sing-box VPN on the old default subnet does not matter any more.
+        let sota = ("172.19.0.1".parse().unwrap(), m30);
+        assert_eq!(pick_tun_v4(&[sota]), Ipv4Addr::new(172, 29, 53, 1));
+        // First candidate taken (/16 that contains it) -> next one.
+        let busy = ("172.29.0.5".parse().unwrap(), m16);
+        assert_eq!(pick_tun_v4(&[sota, busy]), Ipv4Addr::new(10, 233, 137, 1));
+        // A neighbouring /30 in the same /24 does not overlap.
+        let near = ("10.233.137.9".parse().unwrap(), m30);
+        assert_eq!(pick_tun_v4(&[busy, near]), Ipv4Addr::new(10, 233, 137, 1));
+    }
+
+    #[test]
     fn writes_config() {
         let p = Profile { name: "t".into(), kind: ProxyKind::Socks5, host: "1.2.3.4".into(), port: "1080".into(),
                           username: "u".into(), password: "p".into() };
         let mut s = Settings::default();
         s.bypass_processes = "Discord.exe, steam.exe".into();
         s.bypass_domains = "gosuslugi.ru\n*.sber.ru".into();
-        let v = singbox_config(&p, "1.2.3.4:1080".parse().unwrap(), &s);
+        let v = singbox_config(&p, "1.2.3.4:1080".parse().unwrap(), &s, pick_tun_v4(&[]));
         let out = std::env::var("SB_TEST_OUT").unwrap_or_else(|_| std::env::temp_dir().join("sb-test.json").display().to_string());
         std::fs::write(&out, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         let mut h = p.clone(); h.kind = ProxyKind::Http;
-        let v2 = singbox_config(&h, "1.2.3.4:3128".parse().unwrap(), &Settings::default());
+        let v2 = singbox_config(&h, "1.2.3.4:3128".parse().unwrap(), &Settings::default(), pick_tun_v4(&[]));
         std::fs::write(format!("{out}.http.json"), serde_json::to_string_pretty(&v2).unwrap()).unwrap();
     }
 }
