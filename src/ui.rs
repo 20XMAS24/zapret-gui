@@ -398,7 +398,7 @@ impl App {
                 title(ui, "⚡ Обход (winws)");
                 ui.add_space(2.0);
                 if st.bypass_busy {
-                    pill(ui, "запуск...", c_yellow());
+                    pill(ui, "выполняется...", c_yellow());
                 } else if st.zapret_running {
                     pill(ui, "работает", GREEN);
                 } else {
@@ -412,7 +412,7 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(detail).size(13.0).color(c_muted())).truncate());
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                     if st.zapret_running {
-                        if big_button(ui, "Остановить", Bk::Danger, true).clicked() {
+                        if big_button(ui, "Остановить", Bk::Danger, !st.bypass_busy).clicked() {
                             self.core.stop_bypass();
                         }
                     } else if big_button(ui, "Запустить", Bk::Primary, !st.bypass_busy).clicked() {
@@ -609,7 +609,7 @@ impl App {
                 card(ui, |ui| {
                     title(ui, "Управление");
                     if st.bypass_busy {
-                        pill(ui, "запуск...", c_yellow());
+                        pill(ui, "выполняется...", c_yellow());
                     } else if st.zapret_running {
                         pill(ui, "работает", GREEN);
                     } else {
@@ -627,7 +627,7 @@ impl App {
                         if big_button(ui, "Перезапустить с выбранной", Bk::Primary, !st.bypass_busy).clicked() {
                             self.core.restart_bypass();
                         }
-                        if big_button(ui, "Остановить", Bk::Danger, true).clicked() {
+                        if big_button(ui, "Остановить", Bk::Danger, !st.bypass_busy).clicked() {
                             self.core.stop_bypass();
                         }
                     } else if big_button(ui, "Запустить", Bk::Primary, !st.bypass_busy && !st.selected.is_empty()).clicked() {
@@ -865,7 +865,12 @@ impl App {
                         toggle_row(ui, &mut ps.auto_reconnect, "Переподключаться автоматически", "Поднимать туннель заново, если sing-box завершился.");
                         toggle_row(ui, &mut ps.allow_lan, "Локальная сеть напрямую", "Принтеры, роутер, NAS, общие папки — в обход прокси.");
                         toggle_row(ui, &mut ps.block_quic, "Блокировать QUIC (UDP 443)",
-                            "Браузеры сразу перейдут на TCP. Нужно для HTTP-прокси — он не передаёт UDP.");
+                            "Для SOCKS5. С HTTP-прокси весь UDP вне исключений блокируется автоматически; DNS идёт через DoH.");
+                        toggle_row(ui, &mut ps.ipv6, "IPv6 через прокси",
+                            "Включайте, только если сервер поддерживает IPv6. Иначе используется IPv4, чтобы избежать ошибок 502.");
+                        if ps.current().is_some_and(|p| p.kind == ProxyKind::Http) {
+                            ui.label(RichText::new("HTTP-прокси передаёт TCP. Голос, игры и другие приложения, требующие UDP, нуждаются в SOCKS5 с UDP или VPN.").size(12.0).color(c_yellow()));
+                        }
                         toggle_row(ui, &mut ps.connect_on_launch, "Подключать при запуске приложения", "");
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {

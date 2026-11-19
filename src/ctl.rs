@@ -185,7 +185,12 @@ impl Core {
                         let line = strip_ansi(&sys::oem_decode(&buf));
                         let line = line.trim();
                         if !line.is_empty() {
-                            me.log(&format!("{prefix}{line}"), kind);
+                            let level = if prefix == "[sing-box] " {
+                                if line.starts_with("ERROR") || line.starts_with("FATAL") { Kind::Error }
+                                else if line.starts_with("WARN") { Kind::Warn }
+                                else { Kind::Dim }
+                            } else { kind };
+                            me.log(&format!("{prefix}{line}"), level);
                         }
                     }
                 }
@@ -414,20 +419,28 @@ impl Core {
 
     pub fn stop_bypass(self: &Arc<Self>) {
         self.spawn(|me| {
-            me.stop_bypass_sync();
-            me.log("Обход остановлен.", Kind::Info);
+            me.change_bypass("остановки", || {
+                me.stop_bypass_sync()?;
+                me.log("Обход остановлен.", Kind::Info);
+                Ok(())
+            });
         });
     }
 
     pub fn restart_bypass(self: &Arc<Self>) {
         self.spawn(|me| {
-            me.stop_bypass_sync();
-            thread::sleep(Duration::from_millis(300));
-            me.start_bypass_sync(false);
+            me.change_bypass("перезапуска", || {
+                me.stop_bypass_sync()?;
+                me.start_bypass_inner(false)
+            });
         });
     }
 
     fn start_bypass_sync(self: &Arc<Self>, remove_service: bool) {
+        self.change_bypass("запуска", || self.start_bypass_inner(remove_service));
+    }
+
+    fn change_bypass(self: &Arc<Self>, operation: &str, action: impl FnOnce() -> Result<(), String>) {
         {
             let mut s = self.st();
             if s.bypass_busy {
@@ -436,11 +449,11 @@ impl Core {
             s.bypass_busy = true;
         }
         self.repaint();
-        let r = self.start_bypass_inner(remove_service);
+        let r = action();
         self.st().bypass_busy = false;
         if let Err(e) = r {
             if !e.is_empty() {
-                self.log(&format!("Ошибка запуска: {e}"), Kind::Error);
+                self.log(&format!("Ошибка {operation} обхода: {e}"), Kind::Error);
             }
         }
         self.poll();
@@ -471,7 +484,7 @@ impl Core {
         if !paths::winws().is_file() {
             return Err("не найден bin\\winws.exe — приложение лежит не в папке zapret.".into());
         }
-        let args = zapret::build_args(&bat, GameMode::read())?;
+        let args = zapret::build_args(&bat)?;
 
         self.log(&format!("Запуск: {}", zapret::strip_bat(&strategy)), Kind::Info);
         zapret::ensure_user_lists();
@@ -525,13 +538,34 @@ impl Core {
         sys::kill_where(|p| p.name.eq_ignore_ascii_case("winws.exe"));
     }
 
-    fn stop_bypass_sync(&self) {
+    fn stop_bypass_sync(&self) -> Result<(), String> {
+        let state = sys::service_state("zapret");
+        if !matches!(state, None | Some(sys::SVC_STOPPED)) {
+            if state != Some(sys::SVC_STOP_PENDING) {
+                let (code, output) = sys::run(&sys::system32("sc.exe"), "stop zapret");
+                if code != 0 && code != 1062 {
+                    return Err(format!("служба zapret не остановлена ({code}): {}", output.trim()));
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !matches!(sys::service_state("zapret"), None | Some(sys::SVC_STOPPED)) {
+                if Instant::now() >= deadline {
+                    return Err("служба zapret не завершилась за 10 секунд.".into());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
         self.kill_winws();
+        if is_winws_running() {
+            return Err("процесс winws.exe ещё работает.".into());
+        }
         let mut s = self.st();
         s.zapret_running = false;
         s.current_strategy = None;
         drop(s);
         self.repaint();
+        Ok(())
     }
 
     // ------------------------------------------------------------- telegram
@@ -807,8 +841,12 @@ impl Core {
                 let s = me.st();
                 (s.zapret_running, s.current_strategy.clone())
             };
-            me.stop_bypass_sync();
-            thread::sleep(Duration::from_millis(800));
+            if let Err(e) = me.stop_bypass_sync() {
+                me.log(&format!("Обновление прервано: {e}"), Kind::Error);
+                me.st().updating = false;
+                me.repaint();
+                return;
+            }
             let log = |t: &str, k: Kind| me.log(t, k);
             match updater::apply_zapret(&zip, &ver, &log) {
                 Ok(_) => {
@@ -993,10 +1031,9 @@ impl Core {
             return;
         }
         let r = self.connect_inner(gen, reconnect);
-        self.proxy_busy.store(false, Ordering::SeqCst);
-
         if let Err(e) = r {
             if self.proxy_gen.load(Ordering::SeqCst) != gen {
+                self.proxy_busy.store(false, Ordering::SeqCst);
                 return; // user pressed "disconnect" meanwhile
             }
             self.stop_singbox();
@@ -1011,9 +1048,14 @@ impl Core {
                 let mut s = self.st();
                 s.proxy = ProxyState::Failed(e);
                 s.ks_active = killswitch::is_active();
+                drop(s);
+                if reconnect {
+                    self.schedule_reconnect(gen, 5);
+                }
             }
             self.repaint();
         }
+        self.proxy_busy.store(false, Ordering::SeqCst);
     }
 
     fn connect_inner(self: &Arc<Self>, gen: u64, reconnect: bool) -> Result<(), String> {
@@ -1061,15 +1103,10 @@ impl Core {
         if !reconnect {
             if let std::net::IpAddr::V4(v4) = addr.ip() {
                 if let Some(i) = sys::route_iface(v4).filter(|i| !i.hardware && !v4.is_loopback()) {
-                    self.log(
-                        &format!(
-                            "⚠ Включён другой VPN: трафик к прокси идёт через адаптер «{}» ({}). \
-                             Он перехватывает маршруты, поэтому часть трафика пойдёт мимо прокси, пинг сильно вырастет, \
-                             DNS может не работать. Для нормальной работы выключите другой VPN.",
-                            i.alias, i.description
-                        ),
-                        Kind::Warn,
-                    );
+                    return Err(format!(
+                        "трафик к прокси перехватывает VPN-адаптер «{}» ({}). \
+                         Отключите другой VPN и повторите подключение: его маршруты или блокировка \
+                         прямых соединений мешают работе туннеля.", i.alias, i.description));
                 }
             }
         }
@@ -1081,6 +1118,20 @@ impl Core {
         let conf_path = work.join("config.json");
         std::fs::write(&conf_path, serde_json::to_string_pretty(&conf).unwrap_or_default())
             .map_err(|e| format!("не удалось записать конфиг: {e}"))?;
+
+        // Validate with the installed engine before changing firewall rules/routes.
+        let check = sys::hidden(&sb_exe).arg("check").arg("-c").arg(&conf_path)
+            .output().map_err(|e| format!("не удалось проверить конфиг sing-box: {e}"))?;
+        if !check.status.success() {
+            return Err(format!("sing-box отклонил конфигурацию: {}",
+                String::from_utf8_lossy(&check.stderr).trim()));
+        }
+        if self.proxy_gen.load(Ordering::SeqCst) != gen {
+            return Err("отменено".into());
+        }
+        if !reconnect && prof.kind == proxy::ProxyKind::Http {
+            self.log("HTTP-прокси: TCP через туннель, DNS через DoH; остальной UDP вне исключений блокируется.", Kind::Info);
+        }
 
         if settings.kill_switch {
             killswitch::enable(&sb_exe, settings.allow_lan).map_err(|e| format!("kill switch: {e}"))?;
@@ -1148,7 +1199,7 @@ impl Core {
             s.proxy = ProxyState::Connected;
             s.proxy_since = Some(Instant::now());
         }
-        self.log(&format!("Туннель поднят: весь трафик идёт через {}.", prof.display_name()), Kind::Ok);
+        self.log(&format!("TUN-адаптер готов: {}. Проверяю доступ в интернет...", prof.display_name()), Kind::Info);
         self.repaint();
 
         // External IP through the tunnel.
@@ -1159,6 +1210,9 @@ impl Core {
                     return;
                 }
                 if let Ok(ip) = updater::get_string("https://api.ipify.org") {
+                    if me.proxy_gen.load(Ordering::SeqCst) != gen {
+                        return;
+                    }
                     let ip = ip.trim().to_string();
                     if ip.parse::<IpAddr>().is_ok() {
                         me.log(&format!("Внешний IP через туннель: {ip}"), Kind::Info);
@@ -1168,6 +1222,9 @@ impl Core {
                     }
                 }
                 thread::sleep(Duration::from_secs(2));
+            }
+            if me.proxy_gen.load(Ordering::SeqCst) == gen && me.st().proxy == ProxyState::Connected {
+                me.log("Адаптер туннеля создан, но доступ в интернет не подтверждён. Проверьте прокси и отключите другой VPN, если он перехватывает маршруты.", Kind::Warn);
             }
         });
         Ok(())

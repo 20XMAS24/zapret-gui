@@ -11,8 +11,10 @@ where cargo >nul 2>&1 || (echo   [X] cargo not found. Install Rust: https://rust
 cargo build --release --locked
 if errorlevel 1 (echo. & echo   [X] Build FAILED. & pause & exit /b 1)
 
-taskkill /IM ZapretGUI.exe /F >nul 2>&1
+tasklist /FI "IMAGENAME eq ZapretGUI.exe" /NH | find /I "ZapretGUI.exe" >nul
+if not errorlevel 1 (echo   [OK] Built target\release\ZapretGUI.exe. Exit ZapretGUI from the tray before installing. & pause & exit /b 0)
 if exist "..\ZapretGUI.exe" if not exist "..\_backup" mkdir "..\_backup"
+if exist "..\ZapretGUI.exe" if not exist "..\_backup\ZapretGUI-before-local-build.exe" copy "..\ZapretGUI.exe" "..\_backup\ZapretGUI-before-local-build.exe" >nul
 copy /Y "target\release\ZapretGUI.exe" "..\ZapretGUI.exe" >nul
 echo.
 echo   [OK] Built and copied to ..\ZapretGUI.exe

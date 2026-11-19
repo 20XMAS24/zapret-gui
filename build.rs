@@ -1,4 +1,6 @@
-use embed_manifest::{embed_manifest, manifest::ExecutionLevel, new_manifest};
+use embed_manifest::{manifest::ExecutionLevel, new_manifest};
+
+mod build_resources;
 
 fn main() {
     // winws.exe (WinDivert), sing-box (TUN) and the WFP kill switch all need admin rights,
@@ -6,12 +8,13 @@ fn main() {
     // ZAPRET_NO_MANIFEST=1 lets `cargo test` run the test binary without elevation.
     println!("cargo:rerun-if-env-changed=ZAPRET_NO_MANIFEST");
     println!("cargo:rerun-if-env-changed=ZAPRET_GUI_REPO");
-    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() && std::env::var_os("ZAPRET_NO_MANIFEST").is_none() {
-        embed_manifest(
-            new_manifest("ZapretGUI").requested_execution_level(ExecutionLevel::RequireAdministrator),
-        )
-        .expect("unable to embed manifest");
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        let manifest = std::env::var_os("ZAPRET_NO_MANIFEST").is_none().then(||
+            new_manifest("ZapretGUI").requested_execution_level(ExecutionLevel::RequireAdministrator).to_string());
+        build_resources::embed(std::path::Path::new("installer/app.ico"), manifest);
     }
+    println!("cargo:rerun-if-changed=installer/app.ico");
+    println!("cargo:rerun-if-changed=build_resources.rs");
 
     // The self-contained MinGW of the windows-gnu toolchain ships no libshlwapi.a, which the
     // `webbrowser` crate (via egui-winit) links. GNU ld can link straight against a DLL, so put a

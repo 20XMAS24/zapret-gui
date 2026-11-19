@@ -28,43 +28,168 @@ impl GameMode {
     }
 
     pub fn read() -> Self {
-        let Ok(s) = fs::read_to_string(paths::game_flag()) else { return GameMode::Off };
-        let first = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-        match first.to_ascii_lowercase().as_str() {
-            "all" => GameMode::All,
-            "tcp" => GameMode::Tcp,
-            // service.bat falls back to UDP for any other content
-            _ => GameMode::Udp,
-        }
+        GameFilter::read().mode
     }
 
     pub fn write(self) -> std::io::Result<()> {
-        let f = paths::game_flag();
-        if self == GameMode::Off {
-            if f.exists() {
-                fs::remove_file(f)?;
-            }
-            return Ok(());
+        let path = paths::game_flag();
+        let existing = match fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(text) = existing.as_deref().filter(|text| text.contains('=')) {
+            let filter = GameFilter::parse(text);
+            return fs::write(path, format!("mode={}\r\ntcp={}\r\nudp={}\r\n", self.key(), filter.tcp, filter.udp));
+        }
+        if self == Self::Off {
+            return if existing.is_some() { fs::remove_file(path) } else { Ok(()) };
         }
         fs::create_dir_all(paths::utils())?;
-        let v = match self {
-            GameMode::All => "all",
-            GameMode::Tcp => "tcp",
-            _ => "udp",
-        };
-        fs::write(f, format!("{v}\r\n"))
+        fs::write(path, format!("{}\r\n", self.key()))
     }
 
-    /// Mirrors :game_switch_status in service.bat
-    pub fn ports(self) -> (&'static str, &'static str) {
+    fn key(self) -> &'static str {
         match self {
-            GameMode::All => ("1024-65535", "1024-65535"),
-            GameMode::Tcp => ("1024-65535", "12"),
-            GameMode::Udp => ("12", "1024-65535"),
-            GameMode::Off => ("12", "12"),
+            Self::Off => "disabled",
+            Self::All => "all",
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            "tcp" => Self::Tcp,
+            "udp" => Self::Udp,
+            _ => Self::Off,
         }
     }
 }
+
+struct GameFilter {
+    mode: GameMode,
+    tcp: String,
+    udp: String,
+}
+
+impl GameFilter {
+    fn defaults(mode: GameMode) -> Self {
+        Self {
+            mode,
+            tcp: "1024-65535".into(),
+            udp: "1024-65535".into(),
+        }
+    }
+
+    fn read() -> Self {
+        match fs::read_to_string(paths::game_flag()) {
+            Ok(text) => Self::parse(&text),
+            Err(_) => Self::defaults(GameMode::Off),
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        let text = text.trim_start_matches('\u{feff}');
+        if !text.contains('=') {
+            let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+            let mode = match GameMode::parse(first) {
+                GameMode::Off => GameMode::Udp, // Legacy presence flag, including an empty file.
+                mode => mode,
+            };
+            return Self::defaults(mode);
+        }
+        let mut filter = Self::defaults(GameMode::Off);
+        for line in text.lines().map(str::trim) {
+            match line.split_once('=') {
+                Some((key, value)) => match key.trim().to_ascii_lowercase().as_str() {
+                    "mode" => filter.mode = GameMode::parse(value.trim()),
+                    "tcp" => filter.tcp = Self::port_range(value),
+                    "udp" => filter.udp = Self::port_range(value),
+                    _ => {}
+                },
+                None => {
+                    let mode = GameMode::parse(line);
+                    if mode != GameMode::Off {
+                        filter.mode = mode;
+                    }
+                }
+            }
+        }
+        filter
+    }
+
+    fn port_range(value: &str) -> String {
+        fn port(s: &str) -> Option<u16> {
+            if s.starts_with('0') || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse().ok()
+        }
+
+        let value = value.replace(' ', "");
+        if value.split(',').all(|item| {
+            let (first, last) = item.split_once('-').unwrap_or((item, item));
+            matches!((port(first), port(last)), (Some(first), Some(last)) if first <= last)
+        }) {
+            value
+        } else {
+            "1024-65535".into()
+        }
+    }
+
+    fn expand(&self, args: &str) -> String {
+        let (tcp, udp, legacy) = match self.mode {
+            GameMode::Off => ("12", "12", "12"),
+            GameMode::All => (self.tcp.as_str(), self.udp.as_str(), self.tcp.as_str()),
+            GameMode::Tcp => (self.tcp.as_str(), "12", self.tcp.as_str()),
+            GameMode::Udp => ("12", self.udp.as_str(), self.udp.as_str()),
+        };
+        let args = replace_ci(args, "%GameFilterTCP%", tcp);
+        let args = replace_ci(&args, "%GameFilterUDP%", udp);
+        replace_ci(&args, "%GameFilter%", legacy)
+    }
+}
+
+#[cfg(test)]
+mod game_filter_tests {
+    use super::GameFilter;
+
+    const PLACEHOLDERS: &str = "%GameFilterTCP% %GameFilterUDP% %GameFilter%";
+
+    #[test]
+    fn legacy_game_filter_modes_still_expand() {
+        for (flag, expanded) in [
+            ("", "12 1024-65535 1024-65535"),
+            ("udp\r\n", "12 1024-65535 1024-65535"),
+            ("tcp", "1024-65535 12 1024-65535"),
+            ("all", "1024-65535 1024-65535 1024-65535"),
+        ] {
+            assert_eq!(GameFilter::parse(flag).expand(PLACEHOLDERS), expanded);
+        }
+    }
+
+    #[test]
+    fn service_bat_ranges_expand_for_each_mode() {
+        for (mode, expanded) in [
+            ("disabled", "12 12 12"),
+            ("all", "3074,27015 3074,27031-27036 3074,27015"),
+            ("tcp", "3074,27015 12 3074,27015"),
+            ("udp", "12 3074,27031-27036 3074,27031-27036"),
+        ] {
+            let flag = format!("mode={mode}\r\ntcp=3074, 27015\r\nudp=3074,27031-27036\r\n");
+            assert_eq!(GameFilter::parse(&flag).expand(PLACEHOLDERS), expanded);
+        }
+    }
+
+    #[test]
+    fn invalid_ranges_fall_back_independently() {
+        let filter = GameFilter::parse("mode=all\ntcp=3074,27036-27031\nudp=3074");
+        assert_eq!(filter.expand(PLACEHOLDERS), "1024-65535 3074 1024-65535");
+    }
+}
+
 
 // ----------------------------------------------------------------- bat parser
 
@@ -106,7 +231,7 @@ fn leftover_var(s: &str) -> Option<String> {
 
 /// Extracts the winws.exe command line from a strategy .bat and expands
 /// %BIN%, %LISTS%, %~dp0 and the %GameFilterTCP%/%GameFilterUDP% placeholders.
-pub fn build_args(bat: &Path, mode: GameMode) -> Result<String, String> {
+pub fn build_args(bat: &Path) -> Result<String, String> {
     let bytes = fs::read(bat).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
@@ -139,14 +264,11 @@ pub fn build_args(bat: &Path, mode: GameMode) -> Result<String, String> {
         return Err("Аргументы winws.exe пусты.".into());
     }
 
-    let (tcp, udp) = mode.ports();
     let root = paths::win(paths::root());
     args = replace_ci(&args, "%BIN%", &format!("{}\\", paths::win(&paths::bin())));
     args = replace_ci(&args, "%LISTS%", &format!("{}\\", paths::win(&paths::lists())));
     args = replace_ci(&args, "%~dp0", &format!("{root}\\"));
-    args = replace_ci(&args, "%GameFilterTCP%", tcp);
-    args = replace_ci(&args, "%GameFilterUDP%", udp);
-    args = replace_ci(&args, "%GameFilter%", if mode == GameMode::Off { "12" } else { "1024-65535" });
+    args = GameFilter::read().expand(&args);
 
     if let Some(v) = leftover_var(&args) {
         return Err(format!("В стратегии осталась нераспознанная переменная {v}."));

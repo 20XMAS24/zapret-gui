@@ -185,6 +185,7 @@ pub struct Settings {
     pub kill_switch: bool,
     pub allow_lan: bool,
     pub block_quic: bool,
+    pub ipv6: bool,
     pub auto_reconnect: bool,
     pub connect_on_launch: bool,
     pub dns: String,
@@ -200,6 +201,7 @@ impl Default for Settings {
             kill_switch: true,
             allow_lan: true,
             block_quic: true,
+            ipv6: false,
             auto_reconnect: true,
             connect_on_launch: false,
             dns: "1.1.1.1".into(),
@@ -292,6 +294,8 @@ pub fn singbox_config(p: &Profile, server: SocketAddr, s: &Settings, tun_v4: Ipv
     }
 
     let mut rules = vec![
+        // Catch ordinary DNS before sniffing (including TCP DNS).
+        json!({ "port": 53, "action": "hijack-dns" }),
         json!({ "action": "sniff" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
     ];
@@ -304,8 +308,15 @@ pub fn singbox_config(p: &Profile, server: SocketAddr, s: &Settings, tun_v4: Ipv
     if !domains.is_empty() {
         rules.push(json!({ "domain_suffix": domains, "outbound": "direct" }));
     }
-    if s.block_quic {
+    // HTTP CONNECT carries TCP only. Reject all remaining UDP, after DNS and
+    // explicit direct exceptions, so clients can fall back instead of timing out.
+    if p.kind == ProxyKind::Http {
+        rules.push(json!({ "network": "udp", "action": "reject" }));
+    } else if s.block_quic {
         rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));
+    }
+    if !s.ipv6 {
+        rules.push(json!({ "ip_version": 6, "action": "reject" }));
     }
 
     let dns = if s.dns.trim().is_empty() { "1.1.1.1".to_string() } else { s.dns.trim().to_string() };
@@ -319,14 +330,14 @@ pub fn singbox_config(p: &Profile, server: SocketAddr, s: &Settings, tun_v4: Ipv
             ],
             "rules": dns_rules,
             "final": "dns-remote",
-            "strategy": "prefer_ipv4"
+            "strategy": if s.ipv6 { "prefer_ipv4" } else { "ipv4_only" }
         },
         "inbounds": [{
             "type": "tun",
             "tag": "tun-in",
             "interface_name": TUN_NAME,
             "address": [format!("{tun_v4}/30"), TUN_V6],
-            "mtu": 9000,
+            "mtu": 1500,
             "auto_route": true,
             "strict_route": true
         }],
@@ -389,7 +400,7 @@ fn socks5_connect(s: &mut TcpStream, p: &Profile) -> Result<(), String> {
     }
     let mut req = vec![5, 1, 0, 3, TEST_HOST.len() as u8];
     req.extend_from_slice(TEST_HOST.as_bytes());
-    req.extend_from_slice(&80u16.to_be_bytes());
+    req.extend_from_slice(&443u16.to_be_bytes());
     s.write_all(&req).map_err(|e| e.to_string())?;
     let h = read_exact_t(s, 4)?;
     if h[1] != 0 {
@@ -406,7 +417,7 @@ fn socks5_connect(s: &mut TcpStream, p: &Profile) -> Result<(), String> {
 }
 
 fn http_connect(s: &mut TcpStream, p: &Profile) -> Result<(), String> {
-    let mut req = format!("CONNECT {TEST_HOST}:80 HTTP/1.1\r\nHost: {TEST_HOST}:80\r\n");
+    let mut req = format!("CONNECT {TEST_HOST}:443 HTTP/1.1\r\nHost: {TEST_HOST}:443\r\n");
     if !p.username.is_empty() {
         req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", b64(format!("{}:{}", p.username, p.password).as_bytes())));
     }
@@ -422,7 +433,7 @@ fn http_connect(s: &mut TcpStream, p: &Profile) -> Result<(), String> {
     }
 }
 
-fn read_head(s: &mut TcpStream) -> Result<String, String> {
+fn read_head(s: &mut impl Read) -> Result<String, String> {
     let mut buf = Vec::new();
     let mut b = [0u8; 1];
     while buf.len() < 8192 {
@@ -449,7 +460,7 @@ fn status_code(head: &str) -> u16 {
         .unwrap_or(0)
 }
 
-/// Connects to the proxy, tunnels to cp.cloudflare.com:80 and expects HTTP 204. Returns latency in ms.
+/// Checks CONNECT, certificate-verified TLS and HTTPS through the proxy.
 pub fn test(p: &Profile) -> Result<u128, String> {
     let addr = p.resolve()?;
     let t0 = Instant::now();
@@ -460,6 +471,8 @@ pub fn test(p: &Profile) -> Result<u128, String> {
         ProxyKind::Socks5 => socks5_connect(&mut s, p)?,
         ProxyKind::Http => http_connect(&mut s, p)?,
     }
+    let connector = native_tls::TlsConnector::new().map_err(|e| format!("TLS: {e}"))?;
+    let mut s = connector.connect(TEST_HOST, s).map_err(|e| format!("HTTPS через прокси: {e}"))?;
     s.write_all(format!("GET /generate_204 HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n").as_bytes())
         .map_err(|e| e.to_string())?;
     let head = read_head(&mut s)?;
@@ -520,5 +533,125 @@ mod tests {
         let mut h = p.clone(); h.kind = ProxyKind::Http;
         let v2 = singbox_config(&h, "1.2.3.4:3128".parse().unwrap(), &Settings::default(), pick_tun_v4(&[]));
         std::fs::write(format!("{out}.http.json"), serde_json::to_string_pretty(&v2).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn http_rejects_unsupported_udp_even_when_quic_toggle_is_off() {
+        let p = Profile { kind: ProxyKind::Http, ..Profile::default() };
+        let s = Settings { block_quic: false, bypass_processes: "Discord.exe".into(),
+            bypass_domains: "example.org".into(), ..Settings::default() };
+        let v = singbox_config(&p, "192.0.2.1:8000".parse().unwrap(), &s, pick_tun_v4(&[]));
+        let rules = v["route"]["rules"].as_array().unwrap();
+        let udp = rules.iter().position(|r| r["network"] == "udp" && r["action"] == "reject").unwrap();
+        assert!(rules[..udp].iter().any(|r| r["action"] == "hijack-dns"));
+        assert!(rules[..udp].iter().any(|r| r["process_name"][0] == "Discord.exe"));
+        assert!(rules[..udp].iter().any(|r| r["domain_suffix"][0] == "example.org"));
+        assert!(rules[udp].get("port").is_none(), "HTTP must reject UDP on every port");
+        assert_eq!(v["dns"]["strategy"], "ipv4_only");
+        assert!(rules.iter().any(|r| r["ip_version"] == 6 && r["action"] == "reject"));
+    }
+
+    #[test]
+    fn socks_preserves_udp_and_ipv6_when_enabled() {
+        let s = Settings { block_quic: false, ipv6: true, ..Settings::default() };
+        let v = singbox_config(&Profile::default(), "192.0.2.1:1080".parse().unwrap(), &s, pick_tun_v4(&[]));
+        assert_eq!(v["dns"]["strategy"], "prefer_ipv4");
+        assert!(!v["route"]["rules"].as_array().unwrap().iter().any(|r| r["action"] == "reject"));
+    }
+
+    #[test]
+    fn http_probe_uses_https_port_and_reports_auth_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let head = read_head(&mut s).unwrap();
+            assert!(head.starts_with("CONNECT cp.cloudflare.com:443 HTTP/1.1\r\n"));
+            assert!(head.contains("Proxy-Authorization: Basic dTpw\r\n"));
+            s.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n").unwrap();
+        });
+        let mut socket = TcpStream::connect(addr).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let p = Profile { username: "u".into(), password: "p".into(), ..Profile::default() };
+        assert!(http_connect(&mut socket, &p).unwrap_err().contains("407"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "uses the local saved profile and the network; run explicitly"]
+    fn live_profile_https() {
+        let file = std::env::var("ZAPRET_LIVE_PROFILE").expect("set path to local settings");
+        let settings: Settings = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        let ms = test(settings.current().expect("selected profile")).unwrap();
+        println!("Saved proxy: verified HTTPS response in {ms} ms");
+    }
+
+    #[test]
+    #[ignore = "runs the installed sing-box with loopback-only test listeners"]
+    fn live_engine_https_and_dns() {
+        let file = std::env::var("ZAPRET_LIVE_PROFILE").expect("set path to local settings");
+        let mut settings: Settings = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        settings.ipv6 = false;
+        let p = settings.current().unwrap();
+        let mut config = singbox_config(p, p.resolve().unwrap(), &settings, pick_tun_v4(&[]));
+        // This test changes no system routes. Follow the user's current route,
+        // including an existing VPN; physical-interface isolation needs a real TUN test.
+        config["route"]["auto_detect_interface"] = json!(false);
+        let log_path = std::env::temp_dir().join(format!("zapret-engine-test-{}.log", std::process::id()));
+        config["log"] = json!({"level":"debug", "output":log_path});
+        let mixed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dns = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mixed_port = mixed.local_addr().unwrap().port();
+        let dns_port = dns.local_addr().unwrap().port();
+        config["inbounds"] = json!([
+            {"type":"mixed", "tag":"test-proxy", "listen":"127.0.0.1", "listen_port":mixed_port},
+            {"type":"direct", "tag":"test-dns", "listen":"127.0.0.1", "listen_port":dns_port,
+             "override_address":"1.1.1.1", "override_port":53}
+        ]);
+        struct Engine(std::process::Child, std::path::PathBuf);
+        impl Drop for Engine {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let path = std::env::temp_dir().join(format!("zapret-engine-test-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        drop((mixed, dns));
+        let child = sys::hidden(std::env::var("ZAPRET_LIVE_ENGINE").expect("set installed sing-box path"))
+            .args(["run", "-c"]).arg(&path).spawn().unwrap();
+        let _engine = Engine(child, path);
+        let addr = SocketAddr::from(([127, 0, 0, 1], mixed_port));
+        let mut ready = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() { ready = true; break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "sing-box test listener did not start");
+        let local = Profile { host: "127.0.0.1".into(), port: mixed_port.to_string(), ..Profile::default() };
+        let result = test(&local);
+        if result.is_err() { println!("{}", std::fs::read_to_string(&log_path).unwrap_or_default()); }
+        println!("HTTPS through sing-box and saved proxy: {} ms", result.unwrap());
+        for qtype in [1u16, 28] {
+            // TCP DNS query for example.com, through the generated DNS hijack and DoH detour.
+            let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+                7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0];
+            query.extend(qtype.to_be_bytes());
+            query.extend(1u16.to_be_bytes());
+            let mut socket = TcpStream::connect(("127.0.0.1", dns_port)).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+            socket.write_all(&(query.len() as u16).to_be_bytes()).unwrap();
+            socket.write_all(&query).unwrap();
+            let length = read_exact_t(&mut socket, 2).unwrap();
+            let reply = read_exact_t(&mut socket, u16::from_be_bytes([length[0], length[1]]) as usize).unwrap();
+            assert_eq!(&reply[..2], &[0x12, 0x34]);
+            assert_eq!(reply[3] & 15, 0, "DNS error response");
+            let answers = u16::from_be_bytes([reply[6], reply[7]]);
+            if qtype == 1 { assert!(answers > 0, "DoH must return IPv4 addresses"); }
+            else { assert_eq!(answers, 0, "IPv4 mode must suppress AAAA answers"); }
+            println!("DNS type {qtype}: {answers} answers, success");
+        }
     }
 }

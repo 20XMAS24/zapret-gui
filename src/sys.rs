@@ -41,6 +41,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const SVC_STOPPED: u32 = 1;
 pub const SVC_STOP_PENDING: u32 = 3;
 pub const SVC_RUNNING: u32 = 4;
 
