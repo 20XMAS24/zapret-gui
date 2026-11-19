@@ -76,6 +76,12 @@ pub fn run(core: Arc<Core>, autostart: bool) {
     }
 }
 
+struct GameDebugDialog {
+    on_start: bool,
+    targets: String,
+    error: Option<String>,
+}
+
 struct App {
     core: Arc<Core>,
     page: Page,
@@ -89,6 +95,7 @@ struct App {
     import_msg: Option<(bool, String)>,
     show_pass: bool,
     dialog: Option<Dialog>,
+    game_debug_dialog: Option<GameDebugDialog>,
     tray_tip: String,
 }
 
@@ -135,6 +142,7 @@ impl App {
             import_msg: None,
             show_pass: false,
             dialog: None,
+            game_debug_dialog: None,
             tray_tip: String::new(),
         }
     }
@@ -296,6 +304,7 @@ impl eframe::App for App {
             });
 
         self.dialogs(ctx);
+        self.show_game_debug(ctx, &st);
         self.whats_new(ctx, &st);
         resize_grips(ctx);
     }
@@ -545,6 +554,10 @@ impl App {
             ui.allocate_ui_with_layout(vec2(left_w, ui.available_height()), Layout::top_down(Align::Min), |ui| {
                 card(ui, |ui| {
                     ui.add(TextEdit::singleline(&mut self.search).hint_text("🔍  Поиск стратегии").desired_width(ui.available_width() - 2.0));
+                    if button(ui, "Отладка Call of Duty", Bk::Ghost, true).clicked() {
+                        let (on_start, targets) = self.core.game_debug_settings();
+                        self.game_debug_dialog = Some(GameDebugDialog { on_start, targets, error: None });
+                    }
                     ui.add_space(4.0);
                     let q = self.search.to_lowercase();
                     let h = ui.available_height();
@@ -586,10 +599,10 @@ impl App {
                                     GREEN,
                                 );
                             }
-                            if resp.clicked() && !st.bypass_busy {
+                            if resp.clicked() {
                                 self.core.select_strategy(name);
                             }
-                            if resp.double_clicked() && !st.bypass_busy {
+                            if resp.double_clicked() {
                                 self.core.select_strategy(name);
                                 if st.zapret_running {
                                     self.core.restart_bypass();
@@ -617,24 +630,6 @@ impl App {
                     }
                     field_label(ui, "Выбрана");
                     ui.label(RichText::new(zapret::strip_bat(&st.selected)).family(semibold()).color(c_text()));
-                    if st.selected == zapret::CALL_OF_DUTY {
-                        field_label(ui, "Базовая стратегия");
-                        let mut base = st.call_of_duty_base.as_str();
-                        ui.add_enabled_ui(!st.bypass_busy, |ui| {
-                            egui::ComboBox::from_id_salt("call_of_duty_base")
-                                .selected_text(zapret::strip_bat(base))
-                                .width(ui.available_width())
-                                .show_ui(ui, |ui| {
-                                    for name in st.strategies.iter().filter(|name| zapret::is_call_of_duty_base(name)) {
-                                        ui.selectable_value(&mut base, name.as_str(), zapret::strip_bat(name));
-                                    }
-                                });
-                        });
-                        if base != st.call_of_duty_base {
-                            self.core.set_call_of_duty_base(base);
-                        }
-                        muted(ui, "Нужен установленный Cloudflare One. Профиль подключает «Трафик и DNS (UDP)» с выключенным игровым фильтром.");
-                    }
                     if let (true, Some(cur)) = (st.zapret_running, &st.current_strategy) {
                         if cur != &st.selected {
                             ui.label(RichText::new(format!("сейчас работает: {}", zapret::strip_bat(cur))).size(12.5).color(c_yellow()));
@@ -653,25 +648,23 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
-                if st.selected != zapret::CALL_OF_DUTY {
-                    card(ui, |ui| {
-                        title(ui, "Игровой фильтр");
-                        muted(ui, "Расширяет обход на порты 1024–65535 (игры, голос). Применяется при перезапуске.");
-                        let mut g = st.game;
-                        egui::ComboBox::from_id_salt("game")
-                            .selected_text(g.label())
-                            .width(ui.available_width())
-                            .show_ui(ui, |ui| {
-                                for m in GameMode::ALL {
-                                    ui.selectable_value(&mut g, m, m.label());
-                                }
-                            });
-                        if g != st.game {
-                            self.core.set_game(g);
-                        }
-                    });
-                    ui.add_space(4.0);
-                }
+                card(ui, |ui| {
+                    title(ui, "Игровой фильтр");
+                    muted(ui, "Расширяет обход на порты 1024–65535 (игры, голос). Применяется при перезапуске.");
+                    let mut g = st.game;
+                    egui::ComboBox::from_id_salt("game")
+                        .selected_text(g.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for m in GameMode::ALL {
+                                ui.selectable_value(&mut g, m, m.label());
+                            }
+                        });
+                    if g != st.game {
+                        self.core.set_game(g);
+                    }
+                });
+                ui.add_space(4.0);
                 card(ui, |ui| {
                     title(ui, "Подбор");
                     muted(ui, "Штатный скрипт проверит все стратегии на ваших сайтах.");
@@ -684,6 +677,69 @@ impl App {
                 });
             });
         });
+    }
+
+    fn show_game_debug(&mut self, ctx: &egui::Context, st: &State) {
+        let Some(dialog) = self.game_debug_dialog.as_mut() else { return };
+        let mut open = true;
+        let mut saved = false;
+        egui::Window::new("Отладка Call of Duty")
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(465.0)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                muted(ui, "Сначала проверяется доступ к Discord, затем доступность IP игры.");
+                ui.checkbox(&mut dialog.on_start, "Проверять после запуска стратегии");
+                ui.add_space(6.0);
+                field_label(ui, "IP серверов Call of Duty");
+                ui.add(TextEdit::multiline(&mut dialog.targets)
+                    .hint_text("IP или IP:TCP-порт через запятую")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY));
+                muted(ui, "IP проверяется через ICMP, IP:порт — через TCP. Если поле пустое, используются TCP-соединения открытой игры.");
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(RED, error);
+                }
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    let check = button(ui, if st.game_debug_busy { "Проверяю..." } else { "Проверить сейчас" },
+                        Bk::Primary, !st.game_debug_busy && !st.bypass_busy).clicked();
+                    let save = button(ui, "Сохранить", Bk::Ghost, true).clicked();
+                    if check || save {
+                        match self.core.save_game_debug(dialog.on_start, &dialog.targets) {
+                            Ok(()) => {
+                                dialog.error = None;
+                                if check {
+                                    self.core.run_game_debug();
+                                }
+                                saved = save;
+                            }
+                            Err(error) => dialog.error = Some(error),
+                        }
+                    }
+                });
+                if let Some(result) = &st.game_debug_result {
+                    match result {
+                        Ok(path) => {
+                            if button(ui, "Открыть отчёт", Bk::Ghost, true).clicked() {
+                                sys::shell_open(&path.to_string_lossy());
+                            }
+                        }
+                        Err(error) => {
+                            ui.colored_label(RED, format!("Отчёт не сохранён: {error}"));
+                        }
+                    }
+                }
+                let folder = crate::game_diag::report_dir();
+                if button(ui, "Папка отчётов", Bk::Ghost, folder.is_dir()).clicked() {
+                    sys::shell_open(&folder.to_string_lossy());
+                }
+            });
+        if !open || saved {
+            self.game_debug_dialog = None;
+        }
     }
 
     // ---------------------------------------------------------------- proxy

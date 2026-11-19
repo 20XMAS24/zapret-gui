@@ -3,6 +3,7 @@
 mod cfg;
 mod ctl;
 mod diag;
+mod game_diag;
 mod icon;
 mod killswitch;
 mod logbuf;
@@ -13,7 +14,6 @@ mod tg;
 mod theme;
 mod ui;
 mod updater;
-mod warp;
 mod zapret;
 
 use std::path::PathBuf;

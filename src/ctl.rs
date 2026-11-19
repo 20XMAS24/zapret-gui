@@ -15,7 +15,7 @@ use eframe::egui;
 use crate::cfg::Cfg;
 use crate::logbuf::{Kind, LogBuf};
 use crate::zapret::{self, GameMode};
-use crate::{diag, killswitch, paths, proxy, sys, tg, updater, warp};
+use crate::{diag, game_diag, killswitch, paths, proxy, sys, tg, updater};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum ProxyState {
@@ -36,12 +36,13 @@ pub enum Confirm {
 pub struct State {
     pub strategies: Vec<String>,
     pub selected: String,
-    pub call_of_duty_base: String,
     pub zapret_running: bool,
     pub current_strategy: Option<String>,
     pub bypass_busy: bool,
     pub tg_running: bool,
     pub game: GameMode,
+    pub game_debug_busy: bool,
+    pub game_debug_result: Option<Result<PathBuf, String>>,
     pub autostart: bool,
 
     pub zap_local: String,
@@ -76,7 +77,6 @@ pub struct Core {
     pub proxy_cfg: Mutex<proxy::Settings>,
     ctx: OnceLock<egui::Context>,
     winws: Mutex<Option<Child>>,
-    managed_warp: Mutex<Option<PathBuf>>,
     sb: Mutex<Option<Child>>,
     proxy_gen: AtomicU64,
     proxy_busy: AtomicBool,
@@ -90,18 +90,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Core {
     pub fn new(cfg: Cfg) -> Arc<Self> {
         let selected = cfg.get_or("Strategy", "");
-        let call_of_duty_base = cfg.get_or("CallOfDutyBase", zapret::DEFAULT_CALL_OF_DUTY_BASE);
         Arc::new(Core {
             cfg: Mutex::new(cfg),
             st: Mutex::new(State {
                 strategies: Vec::new(),
                 selected,
-                call_of_duty_base,
                 zapret_running: false,
                 current_strategy: None,
                 bypass_busy: false,
                 tg_running: false,
                 game: GameMode::read(),
+                game_debug_busy: false,
+                game_debug_result: None,
                 autostart: false,
                 zap_local: zapret::local_version(),
                 zap_remote: None,
@@ -128,7 +128,6 @@ impl Core {
             proxy_cfg: Mutex::new(proxy::Settings::load()),
             ctx: OnceLock::new(),
             winws: Mutex::new(None),
-            managed_warp: Mutex::new(None),
             sb: Mutex::new(None),
             proxy_gen: AtomicU64::new(0),
             proxy_busy: AtomicBool::new(false),
@@ -382,18 +381,10 @@ impl Core {
     // ----------------------------------------------------------- strategies
 
     pub fn reload_strategies(&self) {
-        let mut items = zapret::list_strategies();
-        let default = items.first().cloned().unwrap_or_default();
+        let items = zapret::list_strategies();
         let mut s = self.st();
-        let first_base = items.iter().find(|name| zapret::is_call_of_duty_base(name));
-        if let Some(first_base) = first_base {
-            if !items.iter().any(|name| name == &s.call_of_duty_base && zapret::is_call_of_duty_base(name)) {
-                s.call_of_duty_base = first_base.clone();
-            }
-            items.insert(0, zapret::CALL_OF_DUTY.into());
-        }
         if !items.contains(&s.selected) {
-            s.selected = default;
+            s.selected = items.first().cloned().unwrap_or_default();
         }
         let n = items.len();
         s.strategies = items;
@@ -405,13 +396,6 @@ impl Core {
         self.st().selected = name.to_string();
         let mut c = lock(&self.cfg);
         c.set("Strategy", name);
-        c.save();
-    }
-
-    pub fn set_call_of_duty_base(&self, name: &str) {
-        self.st().call_of_duty_base = name.to_string();
-        let mut c = lock(&self.cfg);
-        c.set("CallOfDutyBase", name);
         c.save();
     }
 
@@ -481,25 +465,9 @@ impl Core {
     }
 
     fn start_bypass_inner(self: &Arc<Self>, remove_service: bool) -> Result<(), String> {
-        let (strategy, base) = {
-            let s = self.st();
-            (s.selected.clone(), s.call_of_duty_base.clone())
-        };
+        let strategy = self.st().selected.clone();
         if strategy.is_empty() {
             return Err("стратегия не выбрана.".into());
-        }
-
-        let call_of_duty = strategy == zapret::CALL_OF_DUTY;
-        if call_of_duty {
-            let s = self.st();
-            if !zapret::is_call_of_duty_base(&base) || !s.strategies.contains(&base) {
-                return Err("Выберите доступную базовую стратегию general для Call of Duty.".into());
-            }
-            if self.proxy_busy.load(Ordering::SeqCst) || s.ks_active
-                || matches!(s.proxy, ProxyState::Connecting | ProxyState::Connected | ProxyState::Blocked(_))
-            {
-                return Err("Отключите прокси-туннель ZapretGUI перед запуском профиля Call of Duty.".into());
-            }
         }
 
         if sys::service_state("zapret") == Some(sys::SVC_RUNNING) {
@@ -513,22 +481,14 @@ impl Core {
             self.log("Служба zapret остановлена и удалена.", Kind::Info);
         }
 
-        let bat_name = if call_of_duty { &base } else { &strategy };
-        let bat = paths::root().join(bat_name);
+        let bat = paths::root().join(&strategy);
         if !bat.is_file() {
-            return Err(format!("файл стратегии не найден: {bat_name}"));
+            return Err(format!("файл стратегии не найден: {strategy}"));
         }
         if !paths::winws().is_file() {
             return Err("не найден bin\\winws.exe — приложение лежит не в папке zapret.".into());
         }
-        let args = zapret::build_args(&bat, !call_of_duty)?;
-        let warp_to_start = if call_of_duty {
-            self.log(&format!("Call of Duty: {}, игровой фильтр выключен.", zapret::strip_bat(&base)), Kind::Info);
-            warp::prepare()?
-        } else {
-            self.stop_managed_warp()?;
-            None
-        };
+        let args = zapret::build_args(&bat)?;
 
         self.log(&format!("Запуск: {}", zapret::strip_bat(&strategy)), Kind::Info);
         zapret::ensure_user_lists();
@@ -556,16 +516,6 @@ impl Core {
         }
         *lock(&self.winws) = Some(child);
 
-        if call_of_duty {
-            if let Err(error) = self.start_call_of_duty_warp(warp_to_start) {
-                self.kill_winws();
-                if let Err(cleanup_error) = self.stop_managed_warp() {
-                    self.log(&cleanup_error, Kind::Warn);
-                }
-                return Err(error);
-            }
-        }
-
         {
             let mut s = self.st();
             s.current_strategy = Some(strategy.clone());
@@ -581,6 +531,9 @@ impl Core {
         if self.cfg_bool("StartTgOnLaunch", false) && !tg::is_running() {
             self.start_tg_sync();
         }
+        if self.cfg_bool("GameDebugOnStart", false) {
+            self.run_game_debug();
+        }
         Ok(())
     }
 
@@ -592,38 +545,7 @@ impl Core {
         sys::kill_where(|p| p.name.eq_ignore_ascii_case("winws.exe"));
     }
 
-    fn start_call_of_duty_warp(&self, cli: Option<PathBuf>) -> Result<(), String> {
-        if let Some(cli) = cli {
-            self.log("Подключаю Cloudflare One в режиме «Трафик и DNS (UDP)»...", Kind::Info);
-            let mut managed = lock(&self.managed_warp);
-            *managed = Some(cli.clone());
-            warp::connect(&cli)?;
-        }
-        if let Some(child) = lock(&self.winws).as_mut() {
-            match child.try_wait() {
-                Ok(None) => {
-                    self.log("Cloudflare One подключён. Можно запускать Call of Duty.", Kind::Ok);
-                    return Ok(());
-                }
-                Ok(Some(status)) => return Err(format!("winws.exe завершился ({status}). Проверьте журнал.")),
-                Err(e) => return Err(format!("Не удалось проверить winws.exe: {e}")),
-            }
-        }
-        Err("winws.exe был остановлен во время подключения Cloudflare One.".into())
-    }
-
-    fn stop_managed_warp(&self) -> Result<(), String> {
-        let mut managed = lock(&self.managed_warp);
-        if let Some(cli) = managed.as_deref() {
-            warp::disconnect(cli)?;
-            *managed = None;
-            self.log("Cloudflare One отключён.", Kind::Info);
-        }
-        Ok(())
-    }
-
     fn stop_bypass_sync(&self) -> Result<(), String> {
-        self.stop_managed_warp()?;
         let state = sys::service_state("zapret");
         if !matches!(state, None | Some(sys::SVC_STOPPED)) {
             if state != Some(sys::SVC_STOP_PENDING) {
@@ -996,6 +918,64 @@ impl Core {
         self.spawn(|me| diag::run(&|t, k| me.log(t, k)));
     }
 
+    pub fn game_debug_settings(&self) -> (bool, String) {
+        let cfg = lock(&self.cfg);
+        (cfg.get_bool("GameDebugOnStart", false), cfg.get_or("GameDebugTargets", ""))
+    }
+
+    pub fn save_game_debug(&self, on_start: bool, input: &str) -> Result<(), String> {
+        let targets = game_diag::parse_targets(input)?;
+        let text = targets.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        let mut cfg = lock(&self.cfg);
+        cfg.set_bool("GameDebugOnStart", on_start);
+        cfg.set("GameDebugTargets", text);
+        cfg.save();
+        Ok(())
+    }
+
+    pub fn run_game_debug(self: &Arc<Self>) {
+        let (_, targets) = self.game_debug_settings();
+        {
+            let mut state = self.st();
+            if state.game_debug_busy {
+                return;
+            }
+            state.game_debug_busy = true;
+            state.game_debug_result = None;
+        }
+        self.log("Отладка Call of Duty: проверяю Discord, затем IP игры.", Kind::Info);
+        self.spawn(move |me| {
+            // Let winws finish initializing when called from strategy startup.
+            thread::sleep(Duration::from_millis(500));
+            let context = {
+                let state = me.st();
+                let strategy = state.current_strategy.as_deref().unwrap_or("не определена");
+                format!(
+                    "Активная стратегия: {strategy}\nwinws.exe: {}\nНастройка игрового фильтра: {}\nТуннель ZapretGUI: {}",
+                    if is_winws_running() { "запущен" } else { "остановлен" },
+                    GameMode::read().label(),
+                    match state.proxy {
+                        ProxyState::Off => "отключён",
+                        ProxyState::Connecting => "подключается",
+                        ProxyState::Connected => "подключён",
+                        ProxyState::Blocked(_) => "трафик заблокирован",
+                        ProxyState::Failed(_) => "ошибка подключения",
+                    },
+                )
+            };
+            let result = game_diag::run(&context, &targets).map_err(|e| e.to_string());
+            match &result {
+                Ok(path) => me.log(&format!("Отчёт Call of Duty: {}", path.display()), Kind::Info),
+                Err(e) => me.log(&format!("Не удалось сохранить отчёт Call of Duty: {e}"), Kind::Error),
+            }
+            let mut state = me.st();
+            state.game_debug_busy = false;
+            state.game_debug_result = Some(result);
+            drop(state);
+            me.repaint();
+        });
+    }
+
     pub fn clear_discord(self: &Arc<Self>) {
         self.spawn(|me| {
             me.log("▸ Очистка кэша Discord...", Kind::Head);
@@ -1066,15 +1046,6 @@ impl Core {
     }
 
     pub fn proxy_connect(self: &Arc<Self>) {
-        let s = self.st();
-        if (s.bypass_busy && s.selected == zapret::CALL_OF_DUTY)
-            || s.current_strategy.as_deref() == Some(zapret::CALL_OF_DUTY)
-        {
-            drop(s);
-            self.log("Остановите профиль Call of Duty перед подключением прокси-туннеля ZapretGUI.", Kind::Warn);
-            return;
-        }
-        drop(s);
         let gen = self.proxy_gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.spawn(move |me| {
             me.connect_sync(gen, false);
@@ -1153,14 +1124,6 @@ impl Core {
     }
 
     fn connect_inner(self: &Arc<Self>, gen: u64, reconnect: bool) -> Result<(), String> {
-        {
-            let s = self.st();
-            if (s.bypass_busy && s.selected == zapret::CALL_OF_DUTY)
-                || s.current_strategy.as_deref() == Some(zapret::CALL_OF_DUTY)
-            {
-                return Err("Для профиля Call of Duty используется туннель Cloudflare One.".into());
-            }
-        }
         let settings = self.proxy_settings();
         let prof = settings.current().cloned().ok_or("добавьте и выберите прокси-профиль.")?;
         prof.validate()?;
@@ -1382,9 +1345,6 @@ impl Core {
             let _ = killswitch::disable();
         }
         if stop_everything {
-            if let Err(e) = self.stop_managed_warp() {
-                self.log(&e, Kind::Warn);
-            }
             self.kill_winws();
             tg::stop();
         }
