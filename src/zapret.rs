@@ -154,7 +154,7 @@ impl GameFilter {
 
 #[cfg(test)]
 mod game_filter_tests {
-    use super::GameFilter;
+    use super::{build_args, GameFilter};
 
     const PLACEHOLDERS: &str = "%GameFilterTCP% %GameFilterUDP% %GameFilter%";
 
@@ -187,6 +187,15 @@ mod game_filter_tests {
     fn invalid_ranges_fall_back_independently() {
         let filter = GameFilter::parse("mode=all\ntcp=3074,27036-27031\nudp=3074");
         assert_eq!(filter.expand(PLACEHOLDERS), "1024-65535 3074 1024-65535");
+    }
+
+    #[test]
+    fn call_of_duty_uses_the_base_strategy_with_game_filter_off() {
+        let bat = std::env::temp_dir().join(format!("zapret-cod-strategy-{}.bat", std::process::id()));
+        std::fs::write(&bat, "start \"test\" \"%BIN%winws.exe\" --wf-tcp=443,%GameFilterTCP% ^\r\n--wf-udp=443,%GameFilterUDP%").unwrap();
+        let args = build_args(&bat, false);
+        std::fs::remove_file(&bat).unwrap();
+        assert_eq!(args.unwrap(), "--wf-tcp=443,12 --wf-udp=443,12");
     }
 }
 
@@ -231,7 +240,7 @@ fn leftover_var(s: &str) -> Option<String> {
 
 /// Extracts the winws.exe command line from a strategy .bat and expands
 /// %BIN%, %LISTS%, %~dp0 and the %GameFilterTCP%/%GameFilterUDP% placeholders.
-pub fn build_args(bat: &Path) -> Result<String, String> {
+pub fn build_args(bat: &Path, use_game_filter: bool) -> Result<String, String> {
     let bytes = fs::read(bat).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
@@ -268,7 +277,8 @@ pub fn build_args(bat: &Path) -> Result<String, String> {
     args = replace_ci(&args, "%BIN%", &format!("{}\\", paths::win(&paths::bin())));
     args = replace_ci(&args, "%LISTS%", &format!("{}\\", paths::win(&paths::lists())));
     args = replace_ci(&args, "%~dp0", &format!("{root}\\"));
-    args = GameFilter::read().expand(&args);
+    let filter = if use_game_filter { GameFilter::read() } else { GameFilter::defaults(GameMode::Off) };
+    args = filter.expand(&args);
 
     if let Some(v) = leftover_var(&args) {
         return Err(format!("В стратегии осталась нераспознанная переменная {v}."));
@@ -321,6 +331,14 @@ pub fn strip_bat(s: &str) -> &str {
     } else {
         s
     }
+}
+
+pub const CALL_OF_DUTY: &str = "Call of Duty (Cloudflare WARP)";
+pub const DEFAULT_CALL_OF_DUTY_BASE: &str = "general (ALT).bat";
+
+pub fn is_call_of_duty_base(strategy: &str) -> bool {
+    let name = strategy.to_ascii_lowercase();
+    name == "general.bat" || (name.starts_with("general (") && name.ends_with(").bat"))
 }
 
 pub fn ensure_user_lists() {

@@ -586,10 +586,10 @@ impl App {
                                     GREEN,
                                 );
                             }
-                            if resp.clicked() {
+                            if resp.clicked() && !st.bypass_busy {
                                 self.core.select_strategy(name);
                             }
-                            if resp.double_clicked() {
+                            if resp.double_clicked() && !st.bypass_busy {
                                 self.core.select_strategy(name);
                                 if st.zapret_running {
                                     self.core.restart_bypass();
@@ -617,6 +617,24 @@ impl App {
                     }
                     field_label(ui, "Выбрана");
                     ui.label(RichText::new(zapret::strip_bat(&st.selected)).family(semibold()).color(c_text()));
+                    if st.selected == zapret::CALL_OF_DUTY {
+                        field_label(ui, "Базовая стратегия");
+                        let mut base = st.call_of_duty_base.as_str();
+                        ui.add_enabled_ui(!st.bypass_busy, |ui| {
+                            egui::ComboBox::from_id_salt("call_of_duty_base")
+                                .selected_text(zapret::strip_bat(base))
+                                .width(ui.available_width())
+                                .show_ui(ui, |ui| {
+                                    for name in st.strategies.iter().filter(|name| zapret::is_call_of_duty_base(name)) {
+                                        ui.selectable_value(&mut base, name.as_str(), zapret::strip_bat(name));
+                                    }
+                                });
+                        });
+                        if base != st.call_of_duty_base {
+                            self.core.set_call_of_duty_base(base);
+                        }
+                        muted(ui, "Нужен установленный Cloudflare One. Профиль подключает «Трафик и DNS (UDP)» с выключенным игровым фильтром.");
+                    }
                     if let (true, Some(cur)) = (st.zapret_running, &st.current_strategy) {
                         if cur != &st.selected {
                             ui.label(RichText::new(format!("сейчас работает: {}", zapret::strip_bat(cur))).size(12.5).color(c_yellow()));
@@ -635,23 +653,25 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
-                card(ui, |ui| {
-                    title(ui, "Игровой фильтр");
-                    muted(ui, "Расширяет обход на порты 1024–65535 (игры, голос). Применяется при перезапуске.");
-                    let mut g = st.game;
-                    egui::ComboBox::from_id_salt("game")
-                        .selected_text(g.label())
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for m in GameMode::ALL {
-                                ui.selectable_value(&mut g, m, m.label());
-                            }
-                        });
-                    if g != st.game {
-                        self.core.set_game(g);
-                    }
-                });
-                ui.add_space(4.0);
+                if st.selected != zapret::CALL_OF_DUTY {
+                    card(ui, |ui| {
+                        title(ui, "Игровой фильтр");
+                        muted(ui, "Расширяет обход на порты 1024–65535 (игры, голос). Применяется при перезапуске.");
+                        let mut g = st.game;
+                        egui::ComboBox::from_id_salt("game")
+                            .selected_text(g.label())
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for m in GameMode::ALL {
+                                    ui.selectable_value(&mut g, m, m.label());
+                                }
+                            });
+                        if g != st.game {
+                            self.core.set_game(g);
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
                 card(ui, |ui| {
                     title(ui, "Подбор");
                     muted(ui, "Штатный скрипт проверит все стратегии на ваших сайтах.");

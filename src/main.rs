@@ -13,6 +13,7 @@ mod tg;
 mod theme;
 mod ui;
 mod updater;
+mod warp;
 mod zapret;
 
 use std::path::PathBuf;
