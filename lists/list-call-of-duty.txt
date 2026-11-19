@@ -1,0 +1,4 @@
+# Domain suffixes for the Call of Duty strategy.
+callofduty.com
+demonware.net
+s.activision.com

@@ -154,7 +154,7 @@ impl GameFilter {
 
 #[cfg(test)]
 mod game_filter_tests {
-    use super::GameFilter;
+    use super::{add_call_of_duty_hosts, GameFilter};
 
     const PLACEHOLDERS: &str = "%GameFilterTCP% %GameFilterUDP% %GameFilter%";
 
@@ -187,6 +187,29 @@ mod game_filter_tests {
     fn invalid_ranges_fall_back_independently() {
         let filter = GameFilter::parse("mode=all\ntcp=3074,27036-27031\nudp=3074");
         assert_eq!(filter.expand(PLACEHOLDERS), "1024-65535 3074 1024-65535");
+    }
+
+    #[test]
+    fn call_of_duty_domains_extend_only_general_hostlist_rules() {
+        let base = r#"--filter-udp=443 --hostlist="%LISTS%list-general.txt" --new --filter-l7=discord --new --filter-tcp=443 --hostlist="%LISTS%list-general.txt""#;
+        let args = add_call_of_duty_hosts(base).unwrap();
+        assert_eq!(args.matches("--hostlist-domains=callofduty.com,demonware.net,s.activision.com").count(), 2);
+        assert!(args.contains("--new --filter-l7=discord --new"));
+        assert!(add_call_of_duty_hosts("--filter-l7=discord").is_err());
+    }
+
+    #[test]
+    #[ignore = "uses the installed Flowseal strategy"]
+    fn installed_general_alt_supports_call_of_duty_preset() {
+        let root = std::path::PathBuf::from(std::env::var_os("ZAPRET_COD_TEST_ROOT").unwrap());
+        crate::paths::set_root(root.clone(), root.clone());
+        let bat = root.join("general (ALT).bat");
+        let normal = super::build_args(&bat, false).unwrap();
+        let cod = super::build_args(&bat, true).unwrap();
+        assert!(!normal.contains("--hostlist-domains=callofduty.com"));
+        assert!(cod.contains("--hostlist-domains=callofduty.com,demonware.net,s.activision.com"));
+        assert!(cod.contains("--filter-l7=discord,stun"));
+        assert!(cod.contains("--filter-udp=12 "));
     }
 }
 
@@ -231,7 +254,17 @@ fn leftover_var(s: &str) -> Option<String> {
 
 /// Extracts the winws.exe command line from a strategy .bat and expands
 /// %BIN%, %LISTS%, %~dp0 and the %GameFilterTCP%/%GameFilterUDP% placeholders.
-pub fn build_args(bat: &Path) -> Result<String, String> {
+pub const CALL_OF_DUTY: &str = "Call of Duty";
+pub const CALL_OF_DUTY_HOSTLIST: &str = include_str!("../lists/list-call-of-duty.txt");
+const GENERAL_HOSTLIST_ARG: &str = r#"--hostlist="%LISTS%list-general.txt""#;
+
+pub fn call_of_duty_base(strategies: &[String]) -> Option<&str> {
+    ["general (ALT).bat", "general.bat"]
+        .iter()
+        .find_map(|base| strategies.iter().find(|name| name.eq_ignore_ascii_case(base)).map(String::as_str))
+}
+
+pub fn build_args(bat: &Path, call_of_duty: bool) -> Result<String, String> {
     let bytes = fs::read(bat).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
@@ -264,16 +297,31 @@ pub fn build_args(bat: &Path) -> Result<String, String> {
         return Err("Аргументы winws.exe пусты.".into());
     }
 
+    if call_of_duty {
+        args = add_call_of_duty_hosts(&args)?;
+    }
     let root = paths::win(paths::root());
     args = replace_ci(&args, "%BIN%", &format!("{}\\", paths::win(&paths::bin())));
     args = replace_ci(&args, "%LISTS%", &format!("{}\\", paths::win(&paths::lists())));
     args = replace_ci(&args, "%~dp0", &format!("{root}\\"));
-    args = GameFilter::read().expand(&args);
+    let filter = if call_of_duty { GameFilter::defaults(GameMode::Off) } else { GameFilter::read() };
+    args = filter.expand(&args);
 
     if let Some(v) = leftover_var(&args) {
         return Err(format!("В стратегии осталась нераспознанная переменная {v}."));
     }
     Ok(args.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn add_call_of_duty_hosts(args: &str) -> Result<String, String> {
+    if !args.to_ascii_lowercase().contains(&GENERAL_HOSTLIST_ARG.to_ascii_lowercase()) {
+        return Err("В базовой стратегии нет списка list-general.txt для подключения доменов Call of Duty.".into());
+    }
+    let domains = CALL_OF_DUTY_HOSTLIST.lines().map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>().join(",");
+    let argument = format!("{GENERAL_HOSTLIST_ARG} --hostlist-domains={domains}");
+    Ok(replace_ci(args, GENERAL_HOSTLIST_ARG, &argument))
 }
 
 // ------------------------------------------------------------------ strategies

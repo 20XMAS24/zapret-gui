@@ -381,10 +381,14 @@ impl Core {
     // ----------------------------------------------------------- strategies
 
     pub fn reload_strategies(&self) {
-        let items = zapret::list_strategies();
+        let mut items = zapret::list_strategies();
+        let default = items.first().cloned().unwrap_or_default();
+        if zapret::call_of_duty_base(&items).is_some() {
+            items.insert(0, zapret::CALL_OF_DUTY.into());
+        }
         let mut s = self.st();
         if !items.contains(&s.selected) {
-            s.selected = items.first().cloned().unwrap_or_default();
+            s.selected = default;
         }
         let n = items.len();
         s.strategies = items;
@@ -465,7 +469,17 @@ impl Core {
     }
 
     fn start_bypass_inner(self: &Arc<Self>, remove_service: bool) -> Result<(), String> {
-        let strategy = self.st().selected.clone();
+        let (strategy, bat_name) = {
+            let s = self.st();
+            let strategy = s.selected.clone();
+            let bat = if strategy == zapret::CALL_OF_DUTY {
+                zapret::call_of_duty_base(&s.strategies)
+                    .ok_or("Не найдена базовая стратегия general для Call of Duty.")?.to_string()
+            } else {
+                strategy.clone()
+            };
+            (strategy, bat)
+        };
         if strategy.is_empty() {
             return Err("стратегия не выбрана.".into());
         }
@@ -481,14 +495,18 @@ impl Core {
             self.log("Служба zapret остановлена и удалена.", Kind::Info);
         }
 
-        let bat = paths::root().join(&strategy);
+        let call_of_duty = strategy == zapret::CALL_OF_DUTY;
+        let bat = paths::root().join(&bat_name);
         if !bat.is_file() {
-            return Err(format!("файл стратегии не найден: {strategy}"));
+            return Err(format!("файл стратегии не найден: {bat_name}"));
         }
         if !paths::winws().is_file() {
             return Err("не найден bin\\winws.exe — приложение лежит не в папке zapret.".into());
         }
-        let args = zapret::build_args(&bat)?;
+        let args = zapret::build_args(&bat, call_of_duty)?;
+        if call_of_duty {
+            self.log(&format!("Call of Duty: доменный список добавлен к {}. Игровой фильтр выключен.", zapret::strip_bat(&bat_name)), Kind::Info);
+        }
 
         self.log(&format!("Запуск: {}", zapret::strip_bat(&strategy)), Kind::Info);
         zapret::ensure_user_lists();
@@ -531,7 +549,7 @@ impl Core {
         if self.cfg_bool("StartTgOnLaunch", false) && !tg::is_running() {
             self.start_tg_sync();
         }
-        if self.cfg_bool("GameDebugOnStart", false) {
+        if call_of_duty || self.cfg_bool("GameDebugOnStart", false) {
             self.run_game_debug();
         }
         Ok(())
@@ -953,7 +971,7 @@ impl Core {
                 format!(
                     "Активная стратегия: {strategy}\nwinws.exe: {}\nНастройка игрового фильтра: {}\nТуннель ZapretGUI: {}",
                     if is_winws_running() { "запущен" } else { "остановлен" },
-                    GameMode::read().label(),
+                    if strategy == zapret::CALL_OF_DUTY { GameMode::Off.label() } else { GameMode::read().label() },
                     match state.proxy {
                         ProxyState::Off => "отключён",
                         ProxyState::Connecting => "подключается",
@@ -988,6 +1006,9 @@ impl Core {
         if !ps1.is_file() {
             self.log("Не найден utils\\test zapret.ps1", Kind::Error);
             return;
+        }
+        if let Err(e) = game_diag::add_test_targets(&paths::utils().join("targets.txt")) {
+            self.log(&format!("Не удалось добавить Call of Duty в тесты стратегий: {e}"), Kind::Warn);
         }
         let r = std::process::Command::new(sys::system32("WindowsPowerShell\\v1.0\\powershell.exe"))
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])

@@ -1,15 +1,49 @@
 //! Connectivity report for reproducing Discord and Call of Duty failures.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{paths, sys, updater};
 
 const MAX_TARGETS: usize = 12;
 const DISCORD_GATEWAY: &str = "https://discord.com/api/v10/gateway";
+const CALL_OF_DUTY_TARGETS: &[(&str, &str, &str)] = &[
+    ("CallOfDutyProfile", "profile.callofduty.com", "https://profile.callofduty.com/"),
+    ("ActivisionAccount", "s.activision.com", "https://s.activision.com/"),
+    ("DemonwareUmbrella", "prod.umbrella.demonware.net", "PING:prod.umbrella.demonware.net"),
+    ("DemonwareUno", "prod.uno.demonware.net", "PING:prod.uno.demonware.net"),
+];
+
+/// The upstream strategy tester reads utils/targets.txt and has no target override.
+/// Preserve existing entries, even when the user has defined one of these keys.
+pub fn add_test_targets(path: &Path) -> io::Result<()> {
+    let existing = fs::read_to_string(path)?;
+    let additional = missing_test_targets(&existing);
+    if !additional.is_empty() {
+        OpenOptions::new().append(true).open(path)?.write_all(additional.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn missing_test_targets(existing: &str) -> String {
+    let mut additional = String::new();
+    for &(key, _, value) in CALL_OF_DUTY_TARGETS {
+        if !existing.lines().any(|line| {
+            line.split_once('=').is_some_and(|(name, _)| {
+                name.trim().trim_start_matches('\u{feff}').eq_ignore_ascii_case(key)
+            })
+        }) {
+            additional.push_str(&format!("\r\n{key} = \"{value}\""));
+        }
+    }
+    if !additional.is_empty() {
+        additional.push_str("\r\n");
+    }
+    additional
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -73,7 +107,9 @@ pub fn run(context: &str, input: &str) -> io::Result<PathBuf> {
     match discord {
         Ok(()) => {
             writeln!(report, "Доступен ({elapsed} мс). Вход в Discord и голос не проверялись.")?;
-            writeln!(report, "\n2. Call of Duty — проверка IP")?;
+            writeln!(report, "\n2. Call of Duty — встроенные адреса (DNS и TCP 443)")?;
+            check_builtin_targets(&mut report)?;
+            writeln!(report, "\n3. Call of Duty — указанные IP и соединения игры")?;
             report.flush()?;
             check_targets(&mut report, input)?;
         }
@@ -109,6 +145,39 @@ fn discord_process_count() -> usize {
     }).count()
 }
 
+fn check_builtin_targets(report: &mut File) -> io::Result<()> {
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = CALL_OF_DUTY_TARGETS.iter().map(|&(_, host, _)| {
+            scope.spawn(move || probe_domain(host))
+        }).collect();
+        for (target, probe) in CALL_OF_DUTY_TARGETS.iter().zip(probes) {
+            let result = probe.join().unwrap_or_else(|_| "ошибка проверки".into());
+            writeln!(report, "{} — {result}", target.1)?;
+            report.flush()?;
+        }
+        Ok(())
+    })
+}
+
+fn probe_domain(host: &str) -> String {
+    let addresses = match (host, 443).to_socket_addrs() {
+        Ok(addresses) => addresses.collect::<Vec<_>>(),
+        Err(e) => return format!("DNS: {e}"),
+    };
+    let ips = addresses.iter().map(|addr| addr.ip().to_string()).collect::<Vec<_>>().join(", ");
+    let mut result = format!("DNS: {ips}");
+    // Try one address per family. One failed IP does not block the other family.
+    for addr in [addresses.iter().find(|a| a.is_ipv4()), addresses.iter().find(|a| a.is_ipv6())].into_iter().flatten() {
+        let start = Instant::now();
+        let outcome = match TcpStream::connect_timeout(addr, Duration::from_secs(3)) {
+            Ok(_) => format!("подключение за {} мс", start.elapsed().as_millis()),
+            Err(e) => e.to_string(),
+        };
+        result.push_str(&format!(" | TCP {addr}: {outcome}"));
+    }
+    result
+}
+
 fn check_targets(report: &mut File, input: &str) -> io::Result<()> {
     let mut targets = match parse_targets(input) {
         Ok(targets) => targets,
@@ -117,7 +186,7 @@ fn check_targets(report: &mut File, input: &str) -> io::Result<()> {
     if targets.is_empty() {
         targets = match discover_tcp_targets() {
             Ok(targets) if !targets.is_empty() => targets,
-            Ok(_) => return writeln!(report, "IP не проверены: у запущенной игры нет обнаруженных TCP-соединений. Введите адреса вручную или повторите проверку с открытой игрой."),
+            Ok(_) => return writeln!(report, "TCP-соединения игры не обнаружены. Встроенные адреса проверены выше. Игровой UDP и вход в матч не проверялись."),
             Err(error) => return writeln!(report, "IP не проверены: {error}"),
         };
         writeln!(report, "Источник: текущие TCP-соединения процесса Call of Duty.")?;
@@ -218,6 +287,15 @@ mod tests {
     }
 
     #[test]
+    fn adds_only_missing_strategy_test_targets() {
+        let existing = "\u{feff}callofdutyprofile = \"https://custom.test/\"\r\nDiscordMain = \"https://discord.com\"";
+        let extra = missing_test_targets(existing);
+        assert!(!extra.contains("CallOfDutyProfile"));
+        assert!(extra.contains("DemonwareUmbrella"));
+        assert!(missing_test_targets(&format!("{existing}{extra}")).is_empty());
+    }
+
+    #[test]
     #[ignore = "uses the public Discord API and loopback endpoints"]
     fn live_game_debug_report() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -226,6 +304,9 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         println!("{}", path.display());
         assert!(content.contains("Доступен ("), "{content}");
+        for &(_, host, _) in CALL_OF_DUTY_TARGETS {
+            assert!(content.contains(host), "{content}");
+        }
         assert!(content.contains("ICMP: Success"), "{content}");
         assert!(content.contains("TCP: подключение"), "{content}");
     }

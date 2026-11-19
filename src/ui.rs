@@ -630,6 +630,10 @@ impl App {
                     }
                     field_label(ui, "Выбрана");
                     ui.label(RichText::new(zapret::strip_bat(&st.selected)).family(semibold()).color(c_text()));
+                    let call_of_duty = st.selected == zapret::CALL_OF_DUTY;
+                    if call_of_duty {
+                        muted(ui, "Стратегия general с доменами Call of Duty. Отчёт создаётся автоматически.");
+                    }
                     if let (true, Some(cur)) = (st.zapret_running, &st.current_strategy) {
                         if cur != &st.selected {
                             ui.label(RichText::new(format!("сейчас работает: {}", zapret::strip_bat(cur))).size(12.5).color(c_yellow()));
@@ -637,19 +641,25 @@ impl App {
                     }
                     ui.add_space(4.0);
                     if st.zapret_running {
-                        if big_button(ui, "Перезапустить с выбранной", Bk::Primary, !st.bypass_busy).clicked() {
+                        let label = if call_of_duty { "Запустить Call of Duty" } else { "Перезапустить с выбранной" };
+                        if big_button(ui, label, Bk::Primary, !st.bypass_busy).clicked() {
                             self.core.restart_bypass();
                         }
                         if big_button(ui, "Остановить", Bk::Danger, !st.bypass_busy).clicked() {
                             self.core.stop_bypass();
                         }
-                    } else if big_button(ui, "Запустить", Bk::Primary, !st.bypass_busy && !st.selected.is_empty()).clicked() {
+                    } else if big_button(ui, if call_of_duty { "Запустить Call of Duty" } else { "Запустить" },
+                        Bk::Primary, !st.bypass_busy && !st.selected.is_empty()).clicked() {
                         self.core.start_bypass();
                     }
                 });
                 ui.add_space(4.0);
                 card(ui, |ui| {
                     title(ui, "Игровой фильтр");
+                    if st.selected == zapret::CALL_OF_DUTY {
+                        muted(ui, "Выключен для стратегии Call of Duty.");
+                        return;
+                    }
                     muted(ui, "Расширяет обход на порты 1024–65535 (игры, голос). Применяется при перезапуске.");
                     let mut g = st.game;
                     egui::ComboBox::from_id_salt("game")
@@ -690,15 +700,15 @@ impl App {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                muted(ui, "Сначала проверяется доступ к Discord, затем доступность IP игры.");
+                muted(ui, "Сначала Discord, затем встроенные адреса Call of Duty.");
                 ui.checkbox(&mut dialog.on_start, "Проверять после запуска стратегии");
                 ui.add_space(6.0);
-                field_label(ui, "IP серверов Call of Duty");
+                field_label(ui, "Дополнительные IP Call of Duty");
                 ui.add(TextEdit::multiline(&mut dialog.targets)
                     .hint_text("IP или IP:TCP-порт через запятую")
                     .desired_rows(3)
                     .desired_width(f32::INFINITY));
-                muted(ui, "IP проверяется через ICMP, IP:порт — через TCP. Если поле пустое, используются TCP-соединения открытой игры.");
+                muted(ui, "Встроенные адреса проверяются без ввода. Здесь можно указать дополнительные IP или IP:TCP-порт.");
                 if let Some(error) = &dialog.error {
                     ui.colored_label(RED, error);
                 }
